@@ -1,0 +1,31 @@
+"""
+消息 Pydantic Schema
+"""
+from datetime import datetime
+from typing import Optional
+
+from pydantic import BaseModel, Field, ConfigDict
+
+
+class MessageCreate(BaseModel):
+    content: str = Field(..., description="消息内容")
+    role: str = Field(default="user", description="角色: user/assistant/system/tool")
+    event_type: Optional[str] = Field(default=None, description="事件类型")
+    extra_meta: Optional[str] = Field(default=None, description="附加元数据(JSON)")
+
+
+class MessageVO(BaseModel):
+    id: int
+    conversation_id: int
+    role: str
+    content: str
+    event_type: Optional[str] = None
+    extra_meta: Optional[str] = None
+    create_time: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ChatRequest(BaseModel):
+    conversation_id: Optional[int] = Field(default=None, description="会话ID, 不传则创建新会话")
+    message: str = Field(..., min_length=1, description="用户消息")
