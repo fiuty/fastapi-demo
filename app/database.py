@@ -61,5 +61,5 @@ def get_db() -> Session:
 def init_db() -> None:
     """初始化数据库表 (项目启动时调用)"""
     # 导入所有模型, 让 Base.metadata 能感知到它们
-    from app.model import student, teacher  # noqa: F401
+    from app.model import student, teacher, conversation, message  # noqa: F401
     Base.metadata.create_all(bind=engine)

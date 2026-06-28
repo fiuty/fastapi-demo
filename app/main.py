@@ -19,6 +19,8 @@ from app.common.response import Response
 from app.config import settings
 from app.controller.student_controller import router as student_router
 from app.controller.teacher_controller import router as teacher_router
+from app.controller.conversation_controller import router as conversation_router
+from app.controller.agentscope.agentscope_demo_controller import router as agentscope_router
 from app.database import init_db
 
 # 日志 (类似 Spring 的 slf4j)
@@ -73,6 +75,8 @@ def on_startup() -> None:
 # ===================== 注册路由 =====================
 app.include_router(student_router)
 app.include_router(teacher_router)
+app.include_router(conversation_router)
+app.include_router(agentscope_router)
 
 
 # ===================== 全局异常处理器 =====================
