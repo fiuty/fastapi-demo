@@ -1,8 +1,9 @@
 """
 ChatService: Agent 流式对话服务
 整合会话管理、消息持久化、Agent 流式调用
-使用全局 Agent + AgentState 实现多会话隔离
+使用全局 Agent + RedisStorage 持久化 AgentState 实现多会话隔离
 """
+import logging
 from typing import AsyncGenerator
 
 from sqlalchemy.orm import Session
@@ -28,10 +29,13 @@ from agentscope.event import (
     ExceedMaxItersEvent,
 )
 from agentscope.message import Msg, UserMsg, AssistantMsg
+from agentscope.state import AgentState
 
 from app.model.conversation import Conversation
 from app.model.message import Message
 from app.service.agentscope.agent_service import AgentService
+
+logger = logging.getLogger("agentscope")
 
 
 class ChatService:
@@ -47,7 +51,6 @@ class ChatService:
     ) -> AsyncGenerator[dict, None]:
         full_response = ""
         conversation = self._resolve_conversation(conversation_id, user_message[:30], user_id)
-        # conversation.id 本身就是 UUID 字符串, 直接用作 agent 状态隔离的 session_id
         session_id = conversation.id
 
         # 保存用户消息到 DB
@@ -57,14 +60,19 @@ class ChatService:
             content=user_message,
         )
 
-        # 获取全局 Agent 并切换到当前会话的状态
-        agent = AgentService.get_agent(session_id=session_id)
-
-        # 如果状态上下文为空 (首次对话或服务重启), 从 DB 恢复历史消息
-        if not agent.state.context:
+        # 从 Redis 加载会话状态; 过期/不存在则从 DB 恢复历史消息后重建
+        state = await AgentService.load_state(session_id)
+        if state is None:
+            state = AgentState(session_id=session_id)
             history = self._load_history(conversation.id)
             if history:
-                AgentService.load_history_to_state(session_id, history)
+                agent_temp = AgentService.get_agent()
+                agent_temp.state = state
+                agent_temp.observe(history)
+                logger.info("从 DB 恢复历史消息 | session_id=%s | count=%d", session_id, len(history))
+
+        # 将 state 挂载到全局 Agent
+        agent = AgentService.set_agent_state(state)
 
         yield {"event": "conversation_id", "data": {"conversation_id": conversation.id}}
 
@@ -81,6 +89,9 @@ class ChatService:
         except Exception as e:
             yield {"event": "error", "data": {"message": str(e)}}
             return
+        finally:
+            # 无论成功或异常, 都将最新 state 写回 Redis (刷新 TTL)
+            await AgentService.save_state(session_id, agent.state)
 
         # 保存助手回复到 DB
         if full_response:

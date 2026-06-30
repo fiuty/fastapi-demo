@@ -8,6 +8,7 @@ FastAPI 应用入口
     python -m app.main
 """
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -22,6 +23,7 @@ from app.controller.teacher_controller import router as teacher_router
 from app.controller.conversation_controller import router as conversation_router
 from app.controller.agentscope.agentscope_demo_controller import router as agentscope_router
 from app.database import init_db
+from app.service.agentscope.agent_service import AgentService
 
 # 日志 (类似 Spring 的 slf4j)
 logging.basicConfig(
@@ -29,6 +31,21 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("app")
+
+
+# ===================== 应用生命周期 =====================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用启动/关闭生命周期 (类似 Spring 的 @PostConstruct / @PreDestroy)"""
+    # 启动: 初始化数据库 + RedisStorage
+    init_db()
+    logger.info("数据库表初始化完成")
+    await AgentService.init_storage()
+    logger.info("RedisStorage 初始化完成")
+    yield
+    # 关闭: 释放 RedisStorage 连接
+    await AgentService.close_storage()
+    logger.info("RedisStorage 已关闭")
 
 
 # ===================== 应用初始化 =====================
@@ -61,15 +78,8 @@ app = FastAPI(
     docs_url="/docs",       # Swagger UI
     redoc_url="/redoc",     # ReDoc
     openapi_url="/openapi.json",
+    lifespan=lifespan,
 )
-
-
-# ===================== 启动事件 =====================
-@app.on_event("startup")
-def on_startup() -> None:
-    """应用启动时初始化数据库 (类似 Spring 的 CommandLineRunner)"""
-    init_db()
-    logger.info("数据库表初始化完成")
 
 
 # ===================== 注册路由 =====================

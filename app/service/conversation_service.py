@@ -60,8 +60,8 @@ class ConversationService:
             setattr(conv, key, value)
         return self.conversation_dao.update(conv)
 
-    def delete_conversation(self, conversation_id: str) -> None:
+    async def delete_conversation(self, conversation_id: str) -> None:
         conv = self.get_conversation(conversation_id)
-        AgentService.remove_state(conv.id)
+        await AgentService.remove_state(conv.id)
         if not self.conversation_dao.delete_by_id(conv.id):
             raise BizException(code=404, message=f"会话(id={conversation_id})不存在")

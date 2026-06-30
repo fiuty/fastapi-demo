@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = "https://api.deepseek.com"
     LLM_MODEL_NAME: str = "deepseek-v4-flash"
 
+    # Redis 配置 (AgentState 持久化)
+    REDIS_HOST: str = "127.0.0.1"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
+    REDIS_PASSWORD: str = ""
+    # AgentState 会话过期时间 (秒), 1天 = 86400
+    STATE_KEY_TTL: int = 86400
+
     model_config = SettingsConfigDict(
         env_file=str(ENV_FILE),
         env_file_encoding="utf-8",

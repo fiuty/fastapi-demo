@@ -75,9 +75,9 @@ def update_conversation(
 
 
 @router.delete("/{conversation_id}", summary="删除会话")
-def delete_conversation(
+async def delete_conversation(
     conversation_id: str,
     service: ConversationService = Depends(get_conversation_service),
 ):
-    service.delete_conversation(conversation_id)
+    await service.delete_conversation(conversation_id)
     return {"code": 200, "message": "删除成功", "data": None}
