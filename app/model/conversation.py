@@ -1,9 +1,10 @@
 """
 会话 ORM 模型
 """
+import uuid
 from datetime import datetime
 
-from sqlalchemy import Integer, String, DateTime, func, Text
+from sqlalchemy import String, DateTime, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -12,7 +13,9 @@ from app.database import Base
 class Conversation(Base):
     __tablename__ = "t_conversation"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, comment="主键ID")
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4()), comment="主键ID(UUID)"
+    )
     user_id: Mapped[str] = mapped_column(String(50), nullable=False, default="default_user", comment="用户ID")
     title: Mapped[str] = mapped_column(String(200), nullable=False, default="新对话", comment="会话标题")
 

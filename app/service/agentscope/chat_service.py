@@ -1,13 +1,12 @@
 """
 ChatService: Agent 流式对话服务
 整合会话管理、消息持久化、Agent 流式调用
+使用全局 Agent + AgentState 实现多会话隔离
 """
-import json
 from typing import AsyncGenerator
 
 from sqlalchemy.orm import Session
 
-from agentscope.agent import Agent
 from agentscope.event import (
     ReplyStartEvent,
     ReplyEndEvent,
@@ -32,6 +31,7 @@ from agentscope.message import Msg, UserMsg, AssistantMsg
 
 from app.model.conversation import Conversation
 from app.model.message import Message
+from app.service.agentscope.agent_service import AgentService
 
 
 class ChatService:
@@ -41,27 +41,38 @@ class ChatService:
 
     async def chat_stream(
         self,
-        agent: Agent,
         user_message: str,
-        conversation_id: int | None = None,
+        conversation_id: str | None = None,
         user_id: str = "default_user",
     ) -> AsyncGenerator[dict, None]:
         full_response = ""
         conversation = self._resolve_conversation(conversation_id, user_message[:30], user_id)
+        # conversation.id 本身就是 UUID 字符串, 直接用作 agent 状态隔离的 session_id
+        session_id = conversation.id
 
+        # 保存用户消息到 DB
         self._save_message(
             conversation_id=conversation.id,
             role="user",
             content=user_message,
         )
 
-        history = self._load_history(conversation.id)
-        history.append(UserMsg(name=user_id, content=user_message))
+        # 获取全局 Agent 并切换到当前会话的状态
+        agent = AgentService.get_agent(session_id=session_id)
+
+        # 如果状态上下文为空 (首次对话或服务重启), 从 DB 恢复历史消息
+        if not agent.state.context:
+            history = self._load_history(conversation.id)
+            if history:
+                AgentService.load_history_to_state(session_id, history)
 
         yield {"event": "conversation_id", "data": {"conversation_id": conversation.id}}
 
+        # 只传新消息, agent.state.context 会自动累积
+        user_msg = UserMsg(name=user_id, content=user_message)
+
         try:
-            async for event in agent.reply_stream(history):
+            async for event in agent.reply_stream(user_msg):
                 mapped = self._map_event(event)
                 if mapped is not None:
                     if mapped["event"] in ("text_delta",):
@@ -71,6 +82,7 @@ class ChatService:
             yield {"event": "error", "data": {"message": str(e)}}
             return
 
+        # 保存助手回复到 DB
         if full_response:
             assistant_msg = self._save_message(
                 conversation_id=conversation.id,
@@ -82,15 +94,18 @@ class ChatService:
                 "data": {"message_id": assistant_msg.id},
             }
 
-    def _resolve_conversation(self, conversation_id: int | None, title: str, user_id: str) -> Conversation:
+    def _resolve_conversation(
+        self,
+        conversation_id: str | None,
+        title: str,
+        user_id: str,
+    ) -> Conversation:
+        """根据 conversation_id (主键) 查找会话, 不存在则创建"""
         if conversation_id is not None:
             conv = self.db.get(Conversation, conversation_id)
-            if conv is None:
-                conv = Conversation(user_id=user_id, title=title)
-                self.db.add(conv)
-                self.db.flush()
-                self.db.refresh(conv)
-            return conv
+            if conv is not None:
+                return conv
+        # 不存在或未传 conversation_id, 创建新会话 (id 由模型 default 自动生成 UUID)
         conv = Conversation(user_id=user_id, title=title)
         self.db.add(conv)
         self.db.flush()
@@ -99,7 +114,7 @@ class ChatService:
 
     def _save_message(
         self,
-        conversation_id: int,
+        conversation_id: str,
         role: str,
         content: str,
         event_type: str | None = None,
@@ -117,7 +132,7 @@ class ChatService:
         self.db.refresh(msg)
         return msg
 
-    def _load_history(self, conversation_id: int) -> list[Msg]:
+    def _load_history(self, conversation_id: str) -> list[Msg]:
         from sqlalchemy import select
         stmt = (
             select(Message)

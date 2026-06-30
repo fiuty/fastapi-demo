@@ -1,7 +1,9 @@
 """
 AgentService: Agent 创建服务
 分离 model 创建与 agent 创建，调用方可自定义 model 后传入
+内置全局 Agent 单例，通过 AgentState 实现多会话隔离
 """
+import logging
 from typing import Optional
 
 from agentscope.agent import Agent, ModelConfig, ReActConfig
@@ -9,34 +11,41 @@ from agentscope.credential import (
     DashScopeCredential,
     OpenAICredential,
 )
+from agentscope.message import Msg
 from agentscope.model import (
     ChatModelBase,
     DashScopeChatModel,
     OpenAIChatModel,
 )
+from agentscope.state import AgentState
 from agentscope.tool import Toolkit
 
 from app.config import settings
 
+logger = logging.getLogger("agentscope")
+
 
 class AgentService:
-    """Agent 工厂
+    """Agent 工厂 + 全局 Agent 管理
+
+    AgentScope 2.0 支持一个 Agent 实例处理多个会话，通过 AgentState 隔离:
+    - 每个 conversation_id 对应一个独立的 AgentState
+    - 调用前切换 agent.state 即可实现会话间互不影响
 
     Usage:
-        # 方式一: 使用默认模型 (从 config 读取 api_key / base_url)
-        agent = AgentService.create_agent_with_default_model(
-            name="助手",
-            system_prompt="你是一个有用的助手",
-        )
+        # 获取全局 agent (自动切换到对应会话的 state)
+        agent = AgentService.get_agent(session_id="123")
+        async for event in agent.reply_stream(user_msg):
+            ...
 
-        # 方式二: 自定义 model 后传入
-        model = AgentService.create_model(model_name="deepseek-chat")
-        agent = AgentService.create_agent(
-            name="助手",
-            system_prompt="你是一个有用的助手",
-            model=model,
-        )
+        # 也可以单独创建 agent (不走全局单例)
+        agent = AgentService.create_agent_with_default_model(name="助手")
     """
+
+    # 全局 Agent 单例
+    _agent: Optional[Agent] = None
+    # 会话状态池: session_id -> AgentState
+    _states: dict[str, AgentState] = {}
 
     # ======================== Model 创建 ========================
 
@@ -210,4 +219,73 @@ class AgentService:
             tools=tools,
             max_retries=max_retries,
             max_iters=max_iters,
+        )
+
+    # ======================== 全局 Agent 管理 ========================
+
+    DEFAULT_NAME = "assistant"
+    DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+
+    @classmethod
+    def get_agent(cls, session_id: str) -> Agent:
+        """获取全局 Agent，并切换到指定 session 的状态
+
+        AgentScope 2.0 中 Agent 本身是无状态的调度器，真正的会话上下文
+        存放在 AgentState 中。通过切换 agent.state 即可让同一个 agent
+        服务多个互不干扰的会话。
+
+        Args:
+            session_id: 会话标识 (一般用 conversation_id 的字符串)
+
+        Returns:
+            全局 Agent 实例 (state 已切换到对应会话)
+        """
+        if cls._agent is None:
+            cls._agent = cls._create_default_agent()
+            logger.info("全局 Agent 创建完成")
+
+        if session_id not in cls._states:
+            cls._states[session_id] = AgentState(session_id=session_id)
+            logger.info("创建会话状态 | session_id=%s", session_id)
+
+        cls._agent.state = cls._states[session_id]
+        return cls._agent
+
+    @classmethod
+    def has_state(cls, session_id: str) -> bool:
+        """判断指定会话的状态是否已存在 (内存中)"""
+        return session_id in cls._states
+
+    @classmethod
+    def load_history_to_state(cls, session_id: str, messages: list[Msg]) -> None:
+        """将历史消息加载到会话状态中 (用于服务重启后恢复上下文)
+
+        仅在状态上下文为空时加载，避免重复。
+
+        Args:
+            session_id: 会话标识
+            messages: 历史消息列表 (Msg 对象)
+        """
+        agent = cls.get_agent(session_id)
+        if agent.state.context:
+            return
+        if messages:
+            agent.observe(messages)
+            logger.info("加载历史消息到状态 | session_id=%s | count=%d", session_id, len(messages))
+
+    @classmethod
+    def remove_state(cls, session_id: str) -> None:
+        """移除指定会话的状态 (会话删除时调用)"""
+        if session_id in cls._states:
+            del cls._states[session_id]
+            logger.info("移除会话状态 | session_id=%s", session_id)
+
+    @classmethod
+    def _create_default_agent(cls) -> Agent:
+        """创建默认全局 Agent"""
+        model = cls.create_model()
+        return cls.create_agent(
+            name=cls.DEFAULT_NAME,
+            system_prompt=cls.DEFAULT_SYSTEM_PROMPT,
+            model=model,
         )

@@ -16,7 +16,7 @@ class ConversationUpdate(BaseModel):
 
 
 class ConversationVO(BaseModel):
-    id: int
+    id: str
     user_id: str
     title: str
     create_time: datetime

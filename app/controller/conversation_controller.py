@@ -49,7 +49,7 @@ def page_conversations(
 
 @router.get("/{conversation_id}", summary="查询会话详情(含消息)")
 def get_conversation(
-    conversation_id: int,
+    conversation_id: str,
     service: ConversationService = Depends(get_conversation_service),
 ):
     detail = service.get_conversation_detail(conversation_id)
@@ -62,7 +62,7 @@ def get_conversation(
 
 @router.put("/{conversation_id}", summary="更新会话标题")
 def update_conversation(
-    conversation_id: int,
+    conversation_id: str,
     form: ConversationUpdate,
     service: ConversationService = Depends(get_conversation_service),
 ):
@@ -76,7 +76,7 @@ def update_conversation(
 
 @router.delete("/{conversation_id}", summary="删除会话")
 def delete_conversation(
-    conversation_id: int,
+    conversation_id: str,
     service: ConversationService = Depends(get_conversation_service),
 ):
     service.delete_conversation(conversation_id)

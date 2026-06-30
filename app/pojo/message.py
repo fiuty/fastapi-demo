@@ -15,8 +15,8 @@ class MessageCreate(BaseModel):
 
 
 class MessageVO(BaseModel):
-    id: int
-    conversation_id: int
+    id: str
+    conversation_id: str
     role: str
     content: str
     event_type: Optional[str] = None
@@ -27,5 +27,5 @@ class MessageVO(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    conversation_id: Optional[int] = Field(default=None, description="会话ID, 不传则创建新会话")
+    conversation_id: Optional[str] = Field(default=None, description="会话ID, 不传则创建新会话")
     message: str = Field(..., min_length=1, description="用户消息")

@@ -11,7 +11,6 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.pojo.message import ChatRequest
-from app.service.agentscope.agent_service import AgentService
 from app.service.agentscope.chat_service import ChatService
 
 logger = logging.getLogger("agentscope")
@@ -28,17 +27,9 @@ async def chat_stream(
     request: ChatRequest,
     chat_service: ChatService = Depends(get_chat_service),
 ):
-    model = AgentService.create_model()
-    agent = AgentService.create_agent(
-        name="assistant",
-        system_prompt="You are a helpful assistant.",
-        model=model,
-    )
-
     async def event_generator() -> AsyncGenerator[str, None]:
         try:
             async for sse_event in chat_service.chat_stream(
-                agent=agent,
                 user_message=request.message,
                 conversation_id=request.conversation_id,
             ):

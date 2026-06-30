@@ -14,7 +14,7 @@ class ConversationDAO:
     def __init__(self, db: Session):
         self.db = db
 
-    def get_by_id(self, conversation_id: int) -> Optional[Conversation]:
+    def get_by_id(self, conversation_id: str) -> Optional[Conversation]:
         return self.db.get(Conversation, conversation_id)
 
     def page_query(
@@ -52,14 +52,7 @@ class ConversationDAO:
         self.db.refresh(conversation)
         return conversation
 
-    def update_title(self, conversation_id: int, title: str) -> Optional[Conversation]:
-        conv = self.get_by_id(conversation_id)
-        if conv is None:
-            return None
-        conv.title = title
-        return self.update(conv)
-
-    def delete_by_id(self, conversation_id: int) -> bool:
+    def delete_by_id(self, conversation_id: str) -> bool:
         conv = self.get_by_id(conversation_id)
         if conv is None:
             return False

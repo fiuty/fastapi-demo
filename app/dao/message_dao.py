@@ -14,12 +14,12 @@ class MessageDAO:
     def __init__(self, db: Session):
         self.db = db
 
-    def get_by_id(self, message_id: int) -> Optional[Message]:
+    def get_by_id(self, message_id: str) -> Optional[Message]:
         return self.db.get(Message, message_id)
 
     def list_by_conversation(
         self,
-        conversation_id: int,
+        conversation_id: str,
         page: int = 1,
         size: int = 50,
     ) -> tuple[list[Message], int]:
@@ -50,7 +50,7 @@ class MessageDAO:
         self.db.refresh(message)
         return message
 
-    def delete_by_id(self, message_id: int) -> bool:
+    def delete_by_id(self, message_id: str) -> bool:
         msg = self.get_by_id(message_id)
         if msg is None:
             return False
@@ -58,7 +58,7 @@ class MessageDAO:
         self.db.flush()
         return True
 
-    def delete_by_conversation_id(self, conversation_id: int) -> int:
+    def delete_by_conversation_id(self, conversation_id: str) -> int:
         stmt = select(Message).where(Message.conversation_id == conversation_id)
         messages = list(self.db.execute(stmt).scalars().all())
         count = len(messages)
