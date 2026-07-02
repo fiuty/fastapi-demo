@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     # AgentState 会话过期时间 (秒), 1天 = 86400
     STATE_KEY_TTL: int = 86400
 
+    # Agent 上下文压缩配置
+    # token 超过模型上下文窗口的该比例时触发压缩 (0.8 = 80%)
+    CONTEXT_TRIGGER_RATIO: float = 0.8
+    # 压缩时保留最近消息的比例 (0.1 = 10%)
+    CONTEXT_RESERVE_RATIO: float = 0.1
+
     model_config = SettingsConfigDict(
         env_file=str(ENV_FILE),
         env_file_encoding="utf-8",

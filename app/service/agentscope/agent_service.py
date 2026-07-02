@@ -6,13 +6,12 @@ AgentService: Agent 创建服务
 import logging
 from typing import Optional
 
-from agentscope.agent import Agent, ModelConfig, ReActConfig
+from agentscope.agent import Agent, ContextConfig, ModelConfig, ReActConfig
 from agentscope.app.storage import RedisStorage, SessionConfig
 from agentscope.credential import (
     DashScopeCredential,
     OpenAICredential,
 )
-from agentscope.message import Msg
 from agentscope.model import (
     ChatModelBase,
     DashScopeChatModel,
@@ -147,6 +146,7 @@ class AgentService:
         tools: Optional[list] = None,
         max_retries: int = 3,
         max_iters: int = 20,
+        context_config: Optional[ContextConfig] = None,
     ) -> Agent:
         """创建 Agent (核心方法)
 
@@ -157,11 +157,18 @@ class AgentService:
             tools: 工具列表
             max_retries: 模型调用最大重试次数
             max_iters: ReAct 循环最大迭代次数
+            context_config: 上下文压缩配置 (None 时从 config 读取默认值)
 
         Returns:
             Agent 实例
         """
         toolkit = Toolkit(tools=tools) if tools else None
+
+        if context_config is None:
+            context_config = ContextConfig(
+                trigger_ratio=settings.CONTEXT_TRIGGER_RATIO,
+                reserve_ratio=settings.CONTEXT_RESERVE_RATIO,
+            )
 
         return Agent(
             name=name,
@@ -170,6 +177,7 @@ class AgentService:
             toolkit=toolkit,
             model_config=ModelConfig(max_retries=max_retries),
             react_config=ReActConfig(max_iters=max_iters),
+            context_config=context_config,
         )
 
     @staticmethod
@@ -183,6 +191,7 @@ class AgentService:
         tools: Optional[list] = None,
         max_retries: int = 3,
         max_iters: int = 20,
+        context_config: Optional[ContextConfig] = None,
     ) -> Agent:
         """使用默认模型创建 Agent (便捷方法)
 
@@ -198,6 +207,7 @@ class AgentService:
             tools: 工具列表
             max_retries: 最大重试次数
             max_iters: ReAct 最大迭代次数
+            context_config: 上下文压缩配置 (None 时从 config 读取默认值)
 
         Returns:
             Agent 实例
@@ -216,6 +226,7 @@ class AgentService:
             tools=tools,
             max_retries=max_retries,
             max_iters=max_iters,
+            context_config=context_config,
         )
 
     # ======================== 全局 Agent 管理 ========================
