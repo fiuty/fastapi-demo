@@ -68,7 +68,7 @@ class ChatService:
             if history:
                 agent_temp = AgentService.get_agent()
                 agent_temp.state = state
-                agent_temp.observe(history)
+                await agent_temp.observe(history)
                 logger.info("从 DB 恢复历史消息 | session_id=%s | count=%d", session_id, len(history))
 
         # 将 state 挂载到全局 Agent
