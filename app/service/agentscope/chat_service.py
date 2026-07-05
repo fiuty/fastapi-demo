@@ -3,6 +3,7 @@ ChatService: Agent 流式对话服务
 整合会话管理、消息持久化、Agent 流式调用
 使用全局 Agent + RedisStorage 持久化 AgentState 实现多会话隔离
 """
+import json
 import logging
 from typing import AsyncGenerator
 
@@ -49,7 +50,7 @@ class ChatService:
         conversation_id: str | None = None,
         user_id: str = "default_user",
     ) -> AsyncGenerator[dict, None]:
-        full_response = ""
+        full_response: list[dict] = []
         conversation = self._resolve_conversation(conversation_id, user_message[:30], user_id)
         session_id = conversation.id
 
@@ -79,12 +80,18 @@ class ChatService:
         # 只传新消息, agent.state.context 会自动累积
         user_msg = UserMsg(name=user_id, content=user_message)
 
+        assistant_msg = None
+
         try:
             async for event in agent.reply_stream(user_msg):
+                if isinstance(event, ReplyStartEvent):
+                    assistant_msg = AssistantMsg(name=event.name, content=[], id=event.reply_id)
+                elif assistant_msg is not None:
+                    assistant_msg.append_event(event)
+
                 mapped = self._map_event(event)
                 if mapped is not None:
-                    if mapped["event"] in ("text_block_delta",):
-                        full_response += mapped["data"].get("content", "")
+                    full_response.append(mapped)
                     yield mapped
         except Exception as e:
             yield {"event": "error", "data": {"message": str(e)}}
@@ -95,14 +102,15 @@ class ChatService:
 
         # 保存助手回复到 DB
         if full_response:
-            assistant_msg = self._save_message(
+            db_msg = self._save_message(
                 conversation_id=conversation.id,
                 role="assistant",
-                content=full_response,
+                content=json.dumps(full_response, ensure_ascii=False),
+                extra_meta=assistant_msg.model_dump_json() if assistant_msg else None,
             )
             yield {
                 "event": "assistant_message_id",
-                "data": {"message_id": assistant_msg.id},
+                "data": {"message_id": db_msg.id},
             }
 
     def _resolve_conversation(
@@ -156,7 +164,10 @@ class ChatService:
             if msg.role == "user":
                 history.append(UserMsg(name="user", content=msg.content))
             elif msg.role == "assistant":
-                history.append(AssistantMsg(name="assistant", content=msg.content))
+                if msg.extra_meta:
+                    history.append(Msg.model_validate(json.loads(msg.extra_meta)))
+                else:
+                    history.append(AssistantMsg(name="assistant", content=msg.content))
         return history
 
     def _map_event(self, event) -> dict | None:
