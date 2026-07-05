@@ -36,7 +36,6 @@ async def chat_stream(
                 event_type = sse_event["event"]
                 data_str = json.dumps(sse_event["data"], ensure_ascii=False)
                 yield f"event: {event_type}\ndata: {data_str}\n\n"
-            yield "event: done\ndata: {}\n\n"
         except Exception as e:
             logger.exception("流式对话异常")
             error_data = json.dumps({"message": str(e)}, ensure_ascii=False)

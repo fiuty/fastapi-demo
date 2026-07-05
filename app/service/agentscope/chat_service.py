@@ -97,21 +97,8 @@ class ChatService:
             yield {"event": "error", "data": {"message": str(e)}}
             return
         finally:
-            # 无论成功或异常, 都将最新 state 写回 Redis (刷新 TTL)
             await AgentService.save_state(session_id, agent.state)
-
-        # 保存助手回复到 DB
-        if full_response:
-            db_msg = self._save_message(
-                conversation_id=conversation.id,
-                role="assistant",
-                content=json.dumps(full_response, ensure_ascii=False),
-                extra_meta=assistant_msg.model_dump_json() if assistant_msg else None,
-            )
-            yield {
-                "event": "assistant_message_id",
-                "data": {"message_id": db_msg.id},
-            }
+            self._save_assistant_message(conversation.id, full_response, assistant_msg,)
 
     def _resolve_conversation(
         self,
@@ -150,6 +137,27 @@ class ChatService:
         self.db.flush()
         self.db.refresh(msg)
         return msg
+
+    def _save_assistant_message(
+        self,
+        conversation_id: str,
+        full_response: list[dict],
+        assistant_msg: Msg | None,
+    ) -> str | None:
+        """持久化助手回复事件列表, 返回 message_id"""
+        if not full_response:
+            return None
+        try:
+            db_msg = self._save_message(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=json.dumps(full_response, ensure_ascii=False),
+                extra_meta=assistant_msg.model_dump_json() if assistant_msg else None,
+            )
+            return db_msg.id
+        except Exception as ex:
+            logger.warning("保存助手回复失败 | conversation_id=%s | error=%s", conversation_id, ex)
+            return None
 
     def _load_history(self, conversation_id: str) -> list[Msg]:
         from sqlalchemy import select
