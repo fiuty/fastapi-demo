@@ -83,7 +83,7 @@ class ChatService:
             async for event in agent.reply_stream(user_msg):
                 mapped = self._map_event(event)
                 if mapped is not None:
-                    if mapped["event"] in ("text_delta",):
+                    if mapped["event"] in ("text_block_delta",):
                         full_response += mapped["data"].get("content", "")
                     yield mapped
         except Exception as e:
@@ -160,103 +160,72 @@ class ChatService:
         return history
 
     def _map_event(self, event) -> dict | None:
-        event_type = event.type if hasattr(event, "type") else type(event).__name__
+        event_name = event.type.value.lower()
 
-        if isinstance(event, ReplyStartEvent):
-            return {"event": "reply_start", "data": {"reply_id": event.reply_id}}
+        match event:
+            case ReplyStartEvent() | ReplyEndEvent():
+                return {"event": event_name, "data": {"reply_id": event.reply_id}}
 
-        if isinstance(event, ReplyEndEvent):
-            return {"event": "reply_end", "data": {"reply_id": event.reply_id}}
+            case TextBlockStartEvent() | TextBlockEndEvent() | ThinkingBlockStartEvent() | ThinkingBlockEndEvent():
+                return {"event": event_name, "data": {"block_id": event.block_id}}
 
-        if isinstance(event, TextBlockStartEvent):
-            return {"event": "text_start", "data": {"block_id": event.block_id}}
+            case TextBlockDeltaEvent() | ThinkingBlockDeltaEvent():
+                return {"event": event_name, "data": {"content": event.delta, "block_id": event.block_id}}
 
-        if isinstance(event, TextBlockDeltaEvent):
-            return {"event": "text_delta", "data": {"content": event.delta, "block_id": event.block_id}}
+            case ToolCallStartEvent() | ToolResultStartEvent():
+                return {
+                    "event": event_name,
+                    "data": {
+                        "tool_call_id": event.tool_call_id,
+                        "tool_call_name": event.tool_call_name,
+                    },
+                }
 
-        if isinstance(event, TextBlockEndEvent):
-            return {"event": "text_end", "data": {"block_id": event.block_id}}
+            case ToolCallDeltaEvent() | ToolResultTextDeltaEvent():
+                return {
+                    "event": event_name,
+                    "data": {
+                        "tool_call_id": event.tool_call_id,
+                        "delta": event.delta,
+                    },
+                }
 
-        if isinstance(event, ThinkingBlockStartEvent):
-            return {"event": "thinking_start", "data": {"block_id": event.block_id}}
+            case ToolCallEndEvent():
+                return {"event": event_name, "data": {"tool_call_id": event.tool_call_id}}
 
-        if isinstance(event, ThinkingBlockDeltaEvent):
-            return {"event": "thinking_delta", "data": {"content": event.delta, "block_id": event.block_id}}
+            case ToolResultEndEvent():
+                return {
+                    "event": event_name,
+                    "data": {
+                        "tool_call_id": event.tool_call_id,
+                        "state": str(event.state),
+                    },
+                }
 
-        if isinstance(event, ThinkingBlockEndEvent):
-            return {"event": "thinking_end", "data": {"block_id": event.block_id}}
+            case ModelCallStartEvent():
+                return {"event": event_name, "data": {"model_name": event.model_name}}
 
-        if isinstance(event, ToolCallStartEvent):
-            return {
-                "event": "tool_call_start",
-                "data": {
-                    "tool_call_id": event.tool_call_id,
-                    "tool_call_name": event.tool_call_name,
-                },
-            }
+            case ModelCallEndEvent():
+                return {
+                    "event": event_name,
+                    "data": {
+                        "input_tokens": event.input_tokens,
+                        "output_tokens": event.output_tokens,
+                    },
+                }
 
-        if isinstance(event, ToolCallDeltaEvent):
-            return {
-                "event": "tool_call_delta",
-                "data": {
-                    "tool_call_id": event.tool_call_id,
-                    "delta": getattr(event, "delta", ""),
-                },
-            }
+            case HintBlockEvent():
+                return {
+                    "event": event_name,
+                    "data": {
+                        "block_id": event.block_id,
+                        "hint": event.hint,
+                        "source": str(event.source),
+                    },
+                }
 
-        if isinstance(event, ToolCallEndEvent):
-            return {"event": "tool_call_end", "data": {"tool_call_id": event.tool_call_id}}
+            case ExceedMaxItersEvent():
+                return {"event": event_name, "data": {"message": "超过最大迭代次数"}}
 
-        if isinstance(event, ToolResultStartEvent):
-            return {
-                "event": "tool_result_start",
-                "data": {
-                    "tool_call_id": event.tool_call_id,
-                    "tool_call_name": event.tool_call_name,
-                },
-            }
-
-        if isinstance(event, ToolResultTextDeltaEvent):
-            return {
-                "event": "tool_result_delta",
-                "data": {
-                    "tool_call_id": event.tool_call_id,
-                    "content": event.delta,
-                },
-            }
-
-        if isinstance(event, ToolResultEndEvent):
-            return {
-                "event": "tool_result_end",
-                "data": {
-                    "tool_call_id": event.tool_call_id,
-                    "state": str(event.state) if hasattr(event, "state") else None,
-                },
-            }
-
-        if isinstance(event, ModelCallStartEvent):
-            return {"event": "model_call_start", "data": {"model_name": event.model_name}}
-
-        if isinstance(event, ModelCallEndEvent):
-            return {
-                "event": "model_call_end",
-                "data": {
-                    "input_tokens": event.input_tokens,
-                    "output_tokens": event.output_tokens,
-                },
-            }
-
-        if isinstance(event, HintBlockEvent):
-            return {
-                "event": "hint",
-                "data": {
-                    "block_id": event.block_id,
-                    "hint": event.hint,
-                    "source": str(event.source) if hasattr(event, "source") else None,
-                },
-            }
-
-        if isinstance(event, ExceedMaxItersEvent):
-            return {"event": "error", "data": {"message": "超过最大迭代次数"}}
-
-        return None
+            case _:
+                return None
