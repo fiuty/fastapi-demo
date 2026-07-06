@@ -21,6 +21,7 @@ from agentscope.state import AgentState
 from agentscope.tool import Toolkit
 
 from app.config import settings
+from app.service.agentscope.tool_kit_service import ToolkitService
 
 logger = logging.getLogger("agentscope")
 
@@ -143,7 +144,7 @@ class AgentService:
         name: str,
         system_prompt: str,
         model: ChatModelBase,
-        tools: Optional[list] = None,
+        toolkit: Optional[Toolkit] = None,
         max_retries: int = 3,
         max_iters: int = 20,
         context_config: Optional[ContextConfig] = None,
@@ -154,7 +155,7 @@ class AgentService:
             name: Agent 名称
             system_prompt: 系统提示词
             model: ChatModelBase 实例 (需调用方先创建)
-            tools: 工具列表
+            toolkit: 工具列表
             max_retries: 模型调用最大重试次数
             max_iters: ReAct 循环最大迭代次数
             context_config: 上下文压缩配置 (None 时从 config 读取默认值)
@@ -162,7 +163,6 @@ class AgentService:
         Returns:
             Agent 实例
         """
-        toolkit = Toolkit(tools=tools) if tools else None
 
         if context_config is None:
             context_config = ContextConfig(
@@ -188,7 +188,7 @@ class AgentService:
         base_url: Optional[str] = None,
         model_name: Optional[str] = None,
         stream: bool = True,
-        tools: Optional[list] = None,
+        toolkit: Optional[Toolkit] = None,
         max_retries: int = 3,
         max_iters: int = 20,
         context_config: Optional[ContextConfig] = None,
@@ -204,7 +204,7 @@ class AgentService:
             base_url: API 地址 (覆盖 config)
             model_name: 模型名称 (覆盖 config)
             stream: 是否流式输出
-            tools: 工具列表
+            toolkit: 工具列表
             max_retries: 最大重试次数
             max_iters: ReAct 最大迭代次数
             context_config: 上下文压缩配置 (None 时从 config 读取默认值)
@@ -223,7 +223,7 @@ class AgentService:
             name=name,
             system_prompt=system_prompt,
             model=model,
-            tools=tools,
+            toolkit=toolkit,
             max_retries=max_retries,
             max_iters=max_iters,
             context_config=context_config,
@@ -342,4 +342,5 @@ class AgentService:
             name=cls.DEFAULT_NAME,
             system_prompt=cls.DEFAULT_SYSTEM_PROMPT,
             model=model,
+            toolkit=ToolkitService.create_default_toolkit()
         )

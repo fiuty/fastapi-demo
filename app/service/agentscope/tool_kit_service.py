@@ -20,7 +20,7 @@ from typing import Callable, Optional, Sequence
 
 from agentscope.mcp import MCPClient, HttpMCPConfig, StdioMCPConfig
 from agentscope.skill import LocalSkillLoader, Skill
-from agentscope.tool import FunctionTool, Toolkit, ToolBase
+from agentscope.tool import FunctionTool, Toolkit, ToolBase, Bash, Read, Write, Edit, Glob, Grep
 
 logger = logging.getLogger("agentscope")
 
@@ -247,3 +247,9 @@ class ToolkitService:
     def create_empty_toolkit() -> Toolkit:
         """创建空 Toolkit (无工具)"""
         return Toolkit()
+
+
+    @staticmethod
+    def create_default_toolkit() -> Toolkit:
+        """创建 Toolkit """
+        return Toolkit(tools=[Bash(), Read(), Write(), Edit(), Glob(), Grep()])

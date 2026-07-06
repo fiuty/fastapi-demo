@@ -7,6 +7,7 @@ import json
 import logging
 from typing import AsyncGenerator
 
+from agentscope.permission import PermissionContext, PermissionMode
 from sqlalchemy.orm import Session
 
 from agentscope.event import (
@@ -64,7 +65,7 @@ class ChatService:
         # 从 Redis 加载会话状态; 过期/不存在则从 DB 恢复历史消息后重建
         state = await AgentService.load_state(session_id)
         if state is None:
-            state = AgentState(session_id=session_id)
+            state = AgentState(session_id=session_id, permission_context=PermissionContext(mode=PermissionMode.BYPASS))
             history = self._load_history(conversation.id)
             if history:
                 agent_temp = AgentService.get_agent()
