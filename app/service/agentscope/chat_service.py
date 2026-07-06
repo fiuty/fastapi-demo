@@ -29,8 +29,11 @@ from agentscope.event import (
     ModelCallEndEvent,
     HintBlockEvent,
     ExceedMaxItersEvent,
+    RequireUserConfirmEvent,
+    RequireExternalExecutionEvent,
 )
 from agentscope.message import Msg, UserMsg, AssistantMsg
+from agentscope.message._block import ToolCallState
 from agentscope.state import AgentState
 
 from app.model.conversation import Conversation
@@ -75,6 +78,18 @@ class ChatService:
 
         # 将 state 挂载到全局 Agent
         agent = AgentService.set_agent_state(state)
+
+        # # 自动确认上一轮遗留的 pending ASKING 工具调用，避免统一会话一直等到工具调用结果
+        if agent.state.context:
+            last_msg = agent.state.context[-1]
+            if last_msg.role == "assistant":
+                for tc in last_msg.get_content_blocks("tool_call"):
+                    if tc.state == ToolCallState.ASKING:
+                        agent._update_tool_call_state(tc.id, ToolCallState.ALLOWED)
+                        logger.info(
+                            "自动确认上一轮遗留的 tool_call | tool_call_id=%s | name=%s",
+                            tc.id, tc.name,
+                        )
 
         yield {"event": "conversation_id", "data": {"conversation_id": conversation.id}}
 
@@ -290,6 +305,46 @@ class ChatService:
 
             case ExceedMaxItersEvent():
                 return {"event": event_name, "data": {"message": "超过最大迭代次数"}}
+
+            case RequireUserConfirmEvent():
+                return {
+                    "event": event_name,
+                    "data": {
+                        "reply_id": event.reply_id,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "name": tc.name,
+                                "suggested_rules": [
+                                    {
+                                        "tool_name": r.tool_name,
+                                        "rule_content": r.rule_content,
+                                        "behavior": r.behavior.value
+                                        if hasattr(r.behavior, "value")
+                                        else str(r.behavior),
+                                    }
+                                    for r in (tc.suggested_rules or [])
+                                ],
+                            }
+                            for tc in event.tool_calls
+                        ],
+                    },
+                }
+
+            case RequireExternalExecutionEvent():
+                return {
+                    "event": event_name,
+                    "data": {
+                        "reply_id": event.reply_id,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "name": tc.name,
+                            }
+                            for tc in event.tool_calls
+                        ],
+                    },
+                }
 
             case _:
                 return None

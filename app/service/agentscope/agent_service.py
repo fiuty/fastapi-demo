@@ -17,6 +17,7 @@ from agentscope.model import (
     DashScopeChatModel,
     OpenAIChatModel,
 )
+from agentscope.permission import PermissionEngine
 from agentscope.state import AgentState
 from agentscope.tool import Toolkit
 
@@ -332,6 +333,8 @@ class AgentService:
         """将指定 state 挂载到全局 Agent 并返回"""
         agent = cls.get_agent()
         agent.state = state
+        # 更新 agent._engine，引擎在 agent 创建时用默认的 DEFAULT 模式初始化
+        agent._engine = PermissionEngine(state.permission_context)
         return agent
 
     @classmethod
