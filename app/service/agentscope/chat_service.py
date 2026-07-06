@@ -82,6 +82,8 @@ class ChatService:
         user_msg = UserMsg(name=user_id, content=user_message)
 
         assistant_msg = None
+        _open_thinking_blocks: set[str] = set()
+        _pending_events: list[dict] = []
 
         try:
             async for event in agent.reply_stream(user_msg):
@@ -91,9 +93,12 @@ class ChatService:
                     assistant_msg.append_event(event)
 
                 mapped = self._map_event(event)
-                if mapped is not None:
-                    full_response.append(mapped)
-                    yield mapped
+                if mapped is None:
+                    continue
+
+                for ordered in self._reorder_event(mapped, _open_thinking_blocks, _pending_events):
+                    full_response.append(ordered)
+                    yield ordered
         except Exception as e:
             yield {"event": "error", "data": {"message": str(e)}}
             return
@@ -178,6 +183,45 @@ class ChatService:
                 else:
                     history.append(AssistantMsg(name="assistant", content=msg.content))
         return history
+
+    @staticmethod
+    def _reorder_event(
+        mapped: dict | None,
+        open_thinking_blocks: set[str],
+        pending_events: list[dict],
+    ) -> list[dict]:
+        """对事件进行重排序: 在 thinking block 未关闭之前, 缓冲 text block 事件;
+        待 thinking_block_end 到达且所有 thinking block 关闭后, 按序输出缓冲区内容."""
+        if mapped is None:
+            return []
+
+        event_type: str = mapped["event"]
+        block_id: str | None = (mapped.get("data") or {}).get("block_id")
+
+        if event_type == "thinking_block_start":
+            if block_id:
+                open_thinking_blocks.add(block_id)
+            return [mapped]
+
+        if event_type == "thinking_block_end":
+            if block_id:
+                open_thinking_blocks.discard(block_id)
+            if not open_thinking_blocks and pending_events:
+                result = [mapped]
+                result.extend(pending_events)
+                pending_events.clear()
+                return result
+            return [mapped]
+
+        if open_thinking_blocks and event_type in (
+            "text_block_start",
+            "text_block_delta",
+            "text_block_end",
+        ):
+            pending_events.append(mapped)
+            return []
+
+        return [mapped]
 
     def _map_event(self, event) -> dict | None:
         event_name = event.type.value.lower()
