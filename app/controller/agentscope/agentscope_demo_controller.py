@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.pojo.message import ChatRequest, ChatInteractiveRequest
+from app.pojo.message import ChatRequest, ChatInteractiveRequest, InterruptRequest
 from app.service.agentscope.chat_service import ChatService
 
 logger = logging.getLogger("agentscope")
@@ -50,6 +50,25 @@ async def chat_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/chat/interrupt", summary="中断对话(运行中或暂停中)")
+async def chat_interrupt(
+    request: InterruptRequest,
+    chat_service: ChatService = Depends(get_chat_service),
+):
+    """中断指定会话的智能体回复。
+
+    - 若会话正在流式回复: 取消运行任务, Agent 清理上下文后产出 INTERRUPTED 结束事件,
+      原流会收到 ``reply_end`` (finished_reason=interrupted) 后关闭。
+    - 若会话处于暂停(等待工具确认/外部执行): 通过 UserInterruptEvent 清理待处理工具调用。
+    - 若会话无活跃回复: 返回 noop。
+
+    中断后 state 与(部分)消息已持久化, 携带 conversation_id 再次调用
+    ``/chat/stream`` 即可恢复会话, 历史消息不丢失。
+    """
+    result = await chat_service.interrupt(request.conversation_id)
+    return result
 
 
 @router.post("/chat/stream/interactive", summary="交互式流式对话(SSE, 含工具权限确认)")

@@ -9,6 +9,6 @@ SQLAlchemy>=2.0.0
 PyMySQL>=1.1.0
 cryptography>=42.0.0
 
-agentscope==2.0.2
+agentscope==2.0.4
 apscheduler>=3.10.0
 redis>=5.0

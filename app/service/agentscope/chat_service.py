@@ -2,7 +2,15 @@
 ChatService: Agent 流式对话服务
 整合会话管理、消息持久化、Agent 流式调用
 使用全局 Agent + RedisStorage 持久化 AgentState 实现多会话隔离
+
+支持对话中断与恢复:
+- 中断运行中的回复: 取消承载 reply_stream 的 asyncio.Task, Agent 内部捕获
+  CancelledError 后清理上下文并产出 INTERRUPTED 结束事件, 上下文保持一致。
+- 中断暂停中的回复(等待用户确认/外部执行): 通过 UserInterruptEvent 清理待处理工具调用。
+- 恢复: 携带 conversation_id 再次调用 chat_stream 即可, 历史消息与状态从
+  Redis/DB 恢复, 不会丢失。
 """
+import asyncio
 import json
 import logging
 from typing import AsyncGenerator
@@ -13,6 +21,7 @@ from sqlalchemy.orm import Session
 from agentscope.event import (
     ReplyStartEvent,
     ReplyEndEvent,
+    ReplyEndReason,
     TextBlockDeltaEvent,
     TextBlockStartEvent,
     TextBlockEndEvent,
@@ -33,6 +42,7 @@ from agentscope.event import (
     RequireExternalExecutionEvent,
     ConfirmResult,
     UserConfirmResultEvent,
+    UserInterruptEvent,
 )
 from agentscope.message import Msg, UserMsg, AssistantMsg
 from agentscope.message._block import ToolCallState
@@ -47,8 +57,38 @@ logger = logging.getLogger("agentscope")
 
 class ChatService:
 
+    # 会话 ID -> 正在运行的 reply 任务, 供中断接口取消
+    _running_tasks: dict[str, asyncio.Task] = {}
+
     def __init__(self, db: Session):
         self.db = db
+
+    # ======================== 运行任务注册表 ========================
+
+    @classmethod
+    def _register_task(cls, session_id: str, task: asyncio.Task) -> None:
+        """注册流式任务, 供中断接口取消"""
+        cls._running_tasks[session_id] = task
+
+    @classmethod
+    def _unregister_task(cls, session_id: str) -> None:
+        cls._running_tasks.pop(session_id, None)
+
+    @classmethod
+    async def _cancel_running_task(cls, session_id: str) -> None:
+        """取消同会话已存在的运行任务。若任务尚未完成清理则等待最多 10s,
+        确保前一个请求已将 DB conversation 提交后再继续当前请求。"""
+        task = cls._running_tasks.get(session_id)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                # 直接迭代模式下 Agent 的 finally 快速完成 (通常 < 1s)
+                await asyncio.wait_for(task, timeout=10)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+        cls._running_tasks.pop(session_id, None)
+
+    # ======================== 流式对话 ========================
 
     async def chat_stream(
         self,
@@ -56,9 +96,13 @@ class ChatService:
         conversation_id: str | None = None,
         user_id: str = "default_user",
     ) -> AsyncGenerator[dict, None]:
-        full_response: list[dict] = []
-        conversation = self._resolve_conversation(conversation_id, user_message[:30], user_id)
+        conversation = self._resolve_conversation(
+            conversation_id, user_message[:30], user_id,
+        )
         session_id = conversation.id
+
+        # 若同会话存在尚未结束的回复, 取消并等待其清理完成后再继续
+        await ChatService._cancel_running_task(session_id)
 
         # 保存用户消息到 DB
         self._save_message(
@@ -70,18 +114,24 @@ class ChatService:
         # 从 Redis 加载会话状态; 过期/不存在则从 DB 恢复历史消息后重建
         state = await AgentService.load_state(session_id)
         if state is None:
-            state = AgentState(session_id=session_id, permission_context=PermissionContext(mode=PermissionMode.BYPASS))
+            state = AgentState(
+                session_id=session_id,
+                permission_context=PermissionContext(mode=PermissionMode.BYPASS),
+            )
             history = self._load_history(conversation.id)
             if history:
                 agent_temp = AgentService.get_agent()
                 agent_temp.state = state
                 await agent_temp.observe(history)
-                logger.info("从 DB 恢复历史消息 | session_id=%s | count=%d", session_id, len(history))
+                logger.info(
+                    "从 DB 恢复历史消息 | session_id=%s | count=%d",
+                    session_id, len(history),
+                )
 
-        # 将 state 挂载到全局 Agent
-        agent = AgentService.set_agent_state(state)
+        # 创建独立 Agent (不复用全局单例, 避免并发会话 state 互相覆盖)
+        agent = AgentService.create_agent_with_state(state)
 
-        # # 自动确认上一轮遗留的 pending ASKING 工具调用，避免统一会话一直等到工具调用结果
+        # 自动确认上一轮遗留的 pending ASKING 工具调用, 避免统一会话一直等到工具调用结果
         if agent.state.context:
             last_msg = agent.state.context[-1]
             if last_msg.role == "assistant":
@@ -98,30 +148,171 @@ class ChatService:
         # 只传新消息, agent.state.context 会自动累积
         user_msg = UserMsg(name=user_id, content=user_message)
 
-        assistant_msg = None
-        _open_thinking_blocks: set[str] = set()
-        _pending_events: list[dict] = []
+        # 注册当前请求任务, 供中断接口通过 task.cancel() 取消。
+        # 直接迭代 agent.reply_stream, CancelledError 会被 Agent 内部
+        # (model._stream / _reply_impl) 捕获并产出 INTERRUPTED 结束事件,
+        # 随后 async for 正常结束, 进入 finally 持久化。
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            ChatService._register_task(session_id, current_task)
+
+        full_response: list[dict] = []
+        assistant_msg: Msg | None = None
 
         try:
             async for event in agent.reply_stream(user_msg):
                 if isinstance(event, ReplyStartEvent):
-                    assistant_msg = AssistantMsg(name=event.name, content=[], id=event.reply_id)
+                    assistant_msg = AssistantMsg(
+                        name=event.name, content=[], id=event.reply_id,
+                    )
                 elif assistant_msg is not None:
                     assistant_msg.append_event(event)
 
                 mapped = self._map_event(event)
                 if mapped is None:
                     continue
-
-                for ordered in self._reorder_event(mapped, _open_thinking_blocks, _pending_events):
-                    full_response.append(ordered)
-                    yield ordered
+                full_response.append(mapped)
+                yield mapped
+        except asyncio.CancelledError:
+            # 安全网: Agent 默认在内部吞下 CancelledError 并产出 INTERRUPTED
+            # 事件, 不会走到这里。若走到此处(interruption_raise_cancelled_error=True
+            # 等), 记录日志, 不重抛以保证 finally 能正常执行并提交 DB。
+            logger.info("对话被中断(CancelledError 传播到 chat_stream) | session_id=%s", session_id)
         except Exception as e:
+            logger.exception("reply_stream 异常")
             yield {"event": "error", "data": {"message": str(e)}}
-            return
         finally:
-            await AgentService.save_state(session_id, agent.state)
-            self._save_assistant_message(conversation.id, full_response, assistant_msg,)
+            ChatService._unregister_task(session_id)
+            # 持久化 state 与(部分)助手消息。
+            # asyncio.shield 防止取消信号打断 Redis 写入; shield 内部任务
+            # 即使外层被取消也会在后台完成。
+            try:
+                await asyncio.shield(
+                    AgentService.save_state(session_id, agent.state),
+                )
+            except asyncio.CancelledError:
+                logger.warning(
+                    "save_state 被取消(后台仍会完成) | session_id=%s",
+                    session_id,
+                )
+            except Exception:
+                logger.exception("save_state 异常")
+            try:
+                self._save_assistant_message(
+                    conversation.id, full_response, assistant_msg,
+                )
+                # 显式提交, 不依赖 get_db() 的延迟提交。
+                # 中断后请求可能被取消, get_db() 的 commit 不会执行反而可能
+                # rollback, 导致已 flush 的消息丢失。
+                self.db.commit()
+            except Exception:
+                logger.exception("保存助手消息/提交失败")
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+
+    async def interrupt(self, conversation_id: str) -> dict:
+        """中断指定会话的智能体回复。
+
+        两种中断场景(参考 AgentScope 2.0.4 中断智能体文档):
+
+        1. 智能体正在运行: 取消承载 reply_stream 的请求任务, Agent 内部
+           捕获 CancelledError, 清理未完成工具调用并产出 INTERRUPTED 结束事件,
+           上下文保持一致, 可立即通过新输入继续。
+
+           取消后会等待任务清理完成(通常 < 1s, 含 Redis/DB 持久化), 以
+           保证 DB 中 conversation 已提交, 避免后续"继续"请求因未提交而
+           创建重复 conversation 导致消息丢失。
+           最大等待 10 秒, 超时则返回但不影响清理(任务最终仍会完成)。
+
+        2. 智能体处于暂停状态(等待用户确认/外部执行): 向 reply_stream 传入
+           UserInterruptEvent, 清理待处理工具调用并结束当前 reply。
+
+        Returns:
+            dict: 中断结果, 含 status / conversation_id / reason。
+        """
+        # 1. 取消正在运行的回复任务, 等待其 finally 持久化完成
+        task = ChatService._running_tasks.get(conversation_id)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                # 直接迭代模式下 CancelledError 会快速传播到 Agent,
+                # Agent 内部捕获后 finally 持久化 state/消息, 通常 < 1s。
+                await asyncio.wait_for(task, timeout=10)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                logger.warning(
+                    "等待中断清理超时或异常 | conversation_id=%s",
+                    conversation_id,
+                )
+            # 在 await 之后才注销, 避免"继续"请求在 finally 未完成时就
+            # 进入, 导致 DB 中 conversation 未提交而创建重复记录。
+            ChatService._unregister_task(conversation_id)
+            logger.info("已中断运行中的对话 | conversation_id=%s", conversation_id)
+            return {
+                "status": "interrupted",
+                "conversation_id": conversation_id,
+                "reason": "task_cancelled",
+            }
+
+        # 2. 中断暂停中的智能体(等待用户确认/外部执行)
+        state = await AgentService.load_state(conversation_id)
+        if state is None:
+            return {
+                "status": "noop",
+                "conversation_id": conversation_id,
+                "reason": "no_active_session",
+            }
+
+        agent = AgentService.create_agent_with_state(state)
+        if not state.has_awaiting_tool_calls(agent.name):
+            return {
+                "status": "noop",
+                "conversation_id": conversation_id,
+                "reason": "not_parked",
+            }
+
+        reply_id = state.reply_id
+        full_response: list[dict] = []
+        assistant_msg: Msg | None = None
+        try:
+            async for event in agent.reply_stream(
+                UserInterruptEvent(reply_id=reply_id),
+            ):
+                if isinstance(event, ReplyStartEvent):
+                    assistant_msg = AssistantMsg(
+                        name=event.name, content=[], id=event.reply_id,
+                    )
+                elif assistant_msg is not None:
+                    assistant_msg.append_event(event)
+
+                mapped = self._map_event(event)
+                if mapped is not None:
+                    full_response.append(mapped)
+
+            await AgentService.save_state(conversation_id, agent.state)
+            self._save_assistant_message(conversation_id, full_response, assistant_msg)
+            try:
+                self.db.commit()
+            except Exception:
+                logger.exception("parked_interrupt 提交失败")
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+            logger.info("已中断暂停中的对话 | conversation_id=%s", conversation_id)
+            return {
+                "status": "interrupted",
+                "conversation_id": conversation_id,
+                "reason": "parked_interrupted",
+            }
+        except Exception as e:
+            logger.exception("中断暂停中的智能体失败")
+            return {
+                "status": "error",
+                "conversation_id": conversation_id,
+                "message": str(e),
+            }
 
     async def chat_stream_interactive(
         self,
@@ -227,6 +418,15 @@ class ChatService:
                 full_response,
                 assistant_msg,
             )
+            # 显式提交, 不依赖 get_db() 的延迟提交
+            try:
+                self.db.commit()
+            except Exception:
+                logger.exception("chat_stream_interactive 提交失败")
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
 
     @staticmethod
     def _build_interactive_input(
@@ -422,8 +622,17 @@ class ChatService:
         event_name = event.type.value.lower()
 
         match event:
-            case ReplyStartEvent() | ReplyEndEvent():
+            case ReplyStartEvent():
                 return {"event": event_name, "data": {"reply_id": event.reply_id}}
+
+            case ReplyEndEvent():
+                return {
+                    "event": event_name,
+                    "data": {
+                        "reply_id": event.reply_id,
+                        "finished_reason": str(event.finished_reason),
+                    },
+                }
 
             case TextBlockStartEvent() | TextBlockEndEvent() | ThinkingBlockStartEvent() | ThinkingBlockEndEvent():
                 return {"event": event_name, "data": {"block_id": event.block_id}}

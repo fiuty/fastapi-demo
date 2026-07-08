@@ -10,11 +10,13 @@ from agentscope.agent import Agent, ContextConfig, ModelConfig, ReActConfig
 from agentscope.app.storage import RedisStorage, SessionConfig
 from agentscope.credential import (
     DashScopeCredential,
+    DeepSeekCredential,
     OpenAICredential,
 )
 from agentscope.model import (
     ChatModelBase,
     DashScopeChatModel,
+    DeepSeekChatModel,
     OpenAIChatModel,
 )
 from agentscope.permission import PermissionEngine
@@ -54,8 +56,14 @@ class AgentService:
         model_name: Optional[str] = None,
         stream: bool = True,
         max_retries: int = 3,
-    ) -> OpenAIChatModel:
-        """创建默认模型 (OpenAIChatModel)
+    ) -> ChatModelBase:
+        """创建默认模型
+
+        根据 base_url 自动选择最合适的模型实现:
+        - DeepSeek (api.deepseek.com): 使用 DeepSeekChatModel + DeepSeekChatFormatter,
+          后者会在多轮对话中将 ThinkingBlock 作为 reasoning_content 回传给 API,
+          避免思考模型因 reasoning_content 丢失而报 400。
+        - 其它: 使用 OpenAIChatModel。
 
         默认从 config.py 读取 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL_NAME,
         传入参数可覆盖默认值。
@@ -68,15 +76,33 @@ class AgentService:
             max_retries: 最大重试次数
 
         Returns:
-            OpenAIChatModel 实例
+            ChatModelBase 实例
         """
+        actual_base_url = base_url or settings.LLM_BASE_URL
+        actual_api_key = api_key or settings.LLM_API_KEY
+        actual_model = model_name or settings.LLM_MODEL_NAME
+
+        # DeepSeek 思考模型要求多轮对话回传 reasoning_content, 必须使用
+        # DeepSeekChatFormatter (OpenAIChatFormatter 会丢弃 ThinkingBlock)
+        if "deepseek.com" in actual_base_url:
+            credential = DeepSeekCredential(
+                api_key=actual_api_key,
+                base_url=actual_base_url,
+            )
+            return DeepSeekChatModel(
+                credential=credential,
+                model=actual_model,
+                stream=stream,
+                max_retries=max_retries,
+            )
+
         credential = OpenAICredential(
-            api_key=api_key or settings.LLM_API_KEY,
-            base_url=base_url or settings.LLM_BASE_URL,
+            api_key=actual_api_key,
+            base_url=actual_base_url,
         )
         return OpenAIChatModel(
             credential=credential,
-            model=model_name or settings.LLM_MODEL_NAME,
+            model=actual_model,
             stream=stream,
             max_retries=max_retries,
         )
@@ -336,6 +362,26 @@ class AgentService:
         # 更新 agent._engine，引擎在 agent 创建时用默认的 DEFAULT 模式初始化
         agent._engine = PermissionEngine(state.permission_context)
         return agent
+
+    @classmethod
+    def create_agent_with_state(cls, state: AgentState) -> Agent:
+        """创建一个绑定指定 state 的独立 Agent。
+
+        复用全局 Agent 的 model / toolkit / 配置，但 state 独立，避免多个并发会话
+        通过 set_agent_state 互相覆盖全局 Agent 的 state。
+        适用于后台流式任务与中断/恢复等需要 Agent 实例隔离的场景。
+        """
+        template = cls.get_agent()
+        return Agent(
+            name=cls.DEFAULT_NAME,
+            system_prompt=cls.DEFAULT_SYSTEM_PROMPT,
+            model=template.model,
+            toolkit=template.toolkit,
+            model_config=template.model_config,
+            react_config=template.react_config,
+            context_config=template.context_config,
+            state=state,
+        )
 
     @classmethod
     def _create_default_agent(cls) -> Agent:

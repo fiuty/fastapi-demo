@@ -43,3 +43,8 @@ class ChatInteractiveRequest(BaseModel):
     message: Optional[str] = Field(default=None, description="用户新消息（与 confirm_results 二选一）")
     conversation_id: Optional[str] = Field(default=None, description="会话ID，不传则创建新会话")
     confirm_results: Optional[list[ConfirmResultItem]] = Field(default=None, description="工具确认结果列表")
+
+
+class InterruptRequest(BaseModel):
+    """对话中断请求：中断正在运行或处于暂停(等待确认)的智能体会话"""
+    conversation_id: str = Field(..., description="要中断的会话ID")
