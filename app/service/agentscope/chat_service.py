@@ -120,8 +120,7 @@ class ChatService:
             )
             history = self._load_history(conversation.id)
             if history:
-                agent_temp = AgentService.get_agent()
-                agent_temp.state = state
+                agent_temp = await AgentService.create_agent_with_state(state)
                 await agent_temp.observe(history)
                 logger.info(
                     "从 DB 恢复历史消息 | session_id=%s | count=%d",
@@ -129,7 +128,7 @@ class ChatService:
                 )
 
         # 创建独立 Agent (不复用全局单例, 避免并发会话 state 互相覆盖)
-        agent = AgentService.create_agent_with_state(state)
+        agent = await AgentService.create_agent_with_state(state)
 
         # 自动确认上一轮遗留的 pending ASKING 工具调用, 避免统一会话一直等到工具调用结果
         if agent.state.context:
@@ -264,7 +263,7 @@ class ChatService:
                 "reason": "no_active_session",
             }
 
-        agent = AgentService.create_agent_with_state(state)
+        agent = await AgentService.create_agent_with_state(state)
         if not state.has_awaiting_tool_calls(agent.name):
             return {
                 "status": "noop",
@@ -364,8 +363,7 @@ class ChatService:
             )
             history = self._load_history(conversation.id)
             if history:
-                agent_temp = AgentService.get_agent()
-                agent_temp.state = state
+                agent_temp = await AgentService.create_agent_with_state(state)
                 await agent_temp.observe(history)
                 logger.info(
                     "从 DB 恢复历史消息 | session_id=%s | count=%d",
@@ -373,7 +371,7 @@ class ChatService:
                     len(history),
                 )
 
-        agent = AgentService.set_agent_state(state)
+        agent = await AgentService.create_agent_with_state(state)
 
         # 构建输入
         agent_input = self._build_interactive_input(agent, user_message, confirm_results, user_id)

@@ -7,7 +7,7 @@ import logging
 from typing import Optional
 
 from agentscope.agent import Agent, ContextConfig, ModelConfig, ReActConfig
-from agentscope.app.storage import RedisStorage, SessionConfig
+from agentscope.app.storage import AgentData, AgentRecord, RedisStorage, SessionConfig
 from agentscope.credential import (
     DashScopeCredential,
     DeepSeekCredential,
@@ -19,7 +19,6 @@ from agentscope.model import (
     DeepSeekChatModel,
     OpenAIChatModel,
 )
-from agentscope.permission import PermissionEngine
 from agentscope.state import AgentState
 from agentscope.tool import Toolkit
 
@@ -175,6 +174,7 @@ class AgentService:
         max_retries: int = 3,
         max_iters: int = 20,
         context_config: Optional[ContextConfig] = None,
+        react_config: Optional[ReActConfig] = None,
     ) -> Agent:
         """创建 Agent (核心方法)
 
@@ -186,6 +186,7 @@ class AgentService:
             max_retries: 模型调用最大重试次数
             max_iters: ReAct 循环最大迭代次数
             context_config: 上下文压缩配置 (None 时从 config 读取默认值)
+            react_config: ReAct 配置 (None 时使用 max_iters 创建默认值)
 
         Returns:
             Agent 实例
@@ -197,13 +198,16 @@ class AgentService:
                 reserve_ratio=settings.CONTEXT_RESERVE_RATIO,
             )
 
+        if react_config is None:
+            react_config = ReActConfig(max_iters=max_iters)
+
         return Agent(
             name=name,
             system_prompt=system_prompt,
             model=model,
             toolkit=toolkit,
             model_config=ModelConfig(max_retries=max_retries),
-            react_config=ReActConfig(max_iters=max_iters),
+            react_config=react_config,
             context_config=context_config,
         )
 
@@ -263,7 +267,7 @@ class AgentService:
 
     @classmethod
     async def init_storage(cls) -> None:
-        """初始化 RedisStorage (app 启动时调用)"""
+        """初始化 RedisStorage (app 启动时调用, 仅初始化连接)"""
         cls._storage = RedisStorage(
             host=settings.REDIS_HOST,
             port=settings.REDIS_PORT,
@@ -272,7 +276,10 @@ class AgentService:
             key_ttl=settings.STATE_KEY_TTL,
         )
         await cls._storage.__aenter__()
-        logger.info("RedisStorage 初始化完成 | host=%s:%s", settings.REDIS_HOST, settings.REDIS_PORT)
+        logger.info(
+            "RedisStorage 初始化完成 | host=%s:%s",
+            settings.REDIS_HOST, settings.REDIS_PORT,
+        )
 
     @classmethod
     async def close_storage(cls) -> None:
@@ -290,11 +297,62 @@ class AgentService:
 
     @classmethod
     def get_agent(cls) -> Agent:
-        """获取全局 Agent 单例 (不含 state, state 由 load_state 设置)"""
+        """获取全局 Agent 模板 (不含 state)
+
+        懒加载, 首次调用时从配置创建 model / toolkit / 默认配置。
+        该实例仅作为模板复用, 所有需要 state 的场景必须使用
+        create_agent_with_state() 创建独立实例。
+        """
         if cls._agent is None:
             cls._agent = cls._create_default_agent()
-            logger.info("全局 Agent 创建完成")
+            logger.info("全局 Agent 模板创建完成")
         return cls._agent
+
+    @classmethod
+    async def create_agent_with_state(cls, state: AgentState) -> Agent:
+        """从 Redis Agent 记录创建绑定指定 state 的独立 Agent。
+
+        1. 从 Redis 获取 AgentRecord (name / system_prompt / context_config / react_config)
+        2. 首次对话时 Agent 记录不存在则从配置创建并持久化到 Redis
+        3. 复用全局 Agent 模板的 model / toolkit, 构建独立 Agent 实例并绑定 state
+
+        多个并发会话各自调用本方法获取独立 Agent 实例, 不会互相覆盖 state。
+        """
+        storage = cls.get_storage()
+        agent_record = await storage.get_agent(cls.USER_ID, cls.AGENT_ID)
+
+        if agent_record is None:
+            default_context = ContextConfig(
+                trigger_ratio=settings.CONTEXT_TRIGGER_RATIO,
+                reserve_ratio=settings.CONTEXT_RESERVE_RATIO,
+            )
+            default_react = ReActConfig(max_iters=20)
+            agent_record = AgentRecord(
+                id=cls.AGENT_ID,
+                user_id=cls.USER_ID,
+                data=AgentData(
+                    id=cls.AGENT_ID,
+                    name=cls.DEFAULT_NAME,
+                    system_prompt=cls.DEFAULT_SYSTEM_PROMPT,
+                    context_config=default_context,
+                    react_config=default_react,
+                ),
+            )
+            await storage.upsert_agent(cls.USER_ID, agent_record)
+            logger.info("创建并持久化 Agent 记录 | agent_id=%s", cls.AGENT_ID)
+
+        data = agent_record.data
+        template = cls.get_agent()
+        return Agent(
+            name=data.name,
+            system_prompt=data.system_prompt,
+            model=template.model,
+            toolkit=template.toolkit,
+            model_config=template.model_config,
+            react_config=data.react_config,
+            context_config=data.context_config,
+            state=state,
+        )
 
     @classmethod
     async def load_state(cls, session_id: str) -> Optional[AgentState]:
@@ -353,35 +411,6 @@ class AgentService:
         storage = cls.get_storage()
         await storage.delete_session(cls.USER_ID, cls.AGENT_ID, session_id)
         logger.info("删除会话状态 | session_id=%s", session_id)
-
-    @classmethod
-    def set_agent_state(cls, state: AgentState) -> Agent:
-        """将指定 state 挂载到全局 Agent 并返回"""
-        agent = cls.get_agent()
-        agent.state = state
-        # 更新 agent._engine，引擎在 agent 创建时用默认的 DEFAULT 模式初始化
-        agent._engine = PermissionEngine(state.permission_context)
-        return agent
-
-    @classmethod
-    def create_agent_with_state(cls, state: AgentState) -> Agent:
-        """创建一个绑定指定 state 的独立 Agent。
-
-        复用全局 Agent 的 model / toolkit / 配置，但 state 独立，避免多个并发会话
-        通过 set_agent_state 互相覆盖全局 Agent 的 state。
-        适用于后台流式任务与中断/恢复等需要 Agent 实例隔离的场景。
-        """
-        template = cls.get_agent()
-        return Agent(
-            name=cls.DEFAULT_NAME,
-            system_prompt=cls.DEFAULT_SYSTEM_PROMPT,
-            model=template.model,
-            toolkit=template.toolkit,
-            model_config=template.model_config,
-            react_config=template.react_config,
-            context_config=template.context_config,
-            state=state,
-        )
 
     @classmethod
     def _create_default_agent(cls) -> Agent:
