@@ -1,5 +1,5 @@
 """
-ChatService: Agent 流式对话服务
+AgentscopeService: Agent 流式对话服务
 整合会话管理、消息持久化、Agent 流式调用
 使用全局 Agent + RedisStorage 持久化 AgentState 实现多会话隔离
 
@@ -54,7 +54,7 @@ from app.service.agentscope.agent_service import AgentService
 logger = logging.getLogger("agentscope")
 
 
-class ChatService:
+class AgentscopeService:
 
     # 会话 ID -> 正在运行的 reply 任务, 供中断接口取消
     _running_tasks: dict[str, asyncio.Task] = {}
@@ -91,6 +91,19 @@ class ChatService:
                 pass
         cls._running_tasks.pop(session_id, None)
 
+    @staticmethod
+    def _auto_confirm_pending_tool_calls(agent) -> None:
+        if agent.state.context:
+            last_msg = agent.state.context[-1]
+            if last_msg.role == "assistant":
+                for tc in last_msg.get_content_blocks("tool_call"):
+                    if tc.state == ToolCallState.ASKING:
+                        agent._update_tool_call_state(tc.id, ToolCallState.ALLOWED)
+                        logger.info(
+                            "自动确认上一轮遗留的 tool_call | tool_call_id=%s | name=%s",
+                            tc.id, tc.name,
+                        )
+
     # ======================== 流式对话 ========================
 
     async def chat_stream(
@@ -102,7 +115,7 @@ class ChatService:
         conversation, message = await self.handle_conversation(user_message, conversation_id, user_id)
         session_id = conversation.id
         # 若同会话存在尚未结束的回复, 取消并等待其清理完成后再继续
-        await ChatService._cancel_running_task(session_id)
+        await AgentscopeService._cancel_running_task(session_id)
 
         # 从 Redis 加载会话状态; 过期/不存在则从 DB 恢复历史消息后重建
         state = await AgentService.load_state(session_id)
@@ -124,18 +137,7 @@ class ChatService:
         agent = await AgentService.create_agent_with_state(state)
 
         # 自动确认上一轮遗留的 pending ASKING 工具调用, 避免统一会话一直等到工具调用结果
-        if agent.state.context:
-            last_msg = agent.state.context[-1]
-            if last_msg.role == "assistant":
-                for tc in last_msg.get_content_blocks("tool_call"):
-                    if tc.state == ToolCallState.ASKING:
-                        agent._update_tool_call_state(tc.id, ToolCallState.ALLOWED)
-                        logger.info(
-                            "自动确认上一轮遗留的 tool_call | tool_call_id=%s | name=%s",
-                            tc.id, tc.name,
-                        )
-
-        yield {"event": "conversation_id", "data": {"conversation_id": conversation.id}}
+        AgentscopeService._auto_confirm_pending_tool_calls(agent)
 
         # 只传新消息, agent.state.context 会自动累积
         user_msg = UserMsg(name=user_id, content=user_message)
@@ -146,7 +148,7 @@ class ChatService:
         # 随后 async for 正常结束, 进入 finally 持久化。
         current_task = asyncio.current_task()
         if current_task is not None:
-            ChatService._register_task(session_id, current_task)
+            AgentscopeService._register_task(session_id, current_task)
 
         full_response: list[dict] = []
         assistant_msg: Msg | None = None
@@ -163,6 +165,7 @@ class ChatService:
                 mapped = self._map_event(event)
                 if mapped is None:
                     continue
+
                 full_response.append(mapped)
                 yield mapped
         except asyncio.CancelledError:
@@ -174,10 +177,24 @@ class ChatService:
             logger.exception("reply_stream 异常")
             yield {"event": "error", "data": {"message": str(e)}}
         finally:
-            ChatService._unregister_task(session_id)
-            # 持久化 state 与(部分)助手消息。
-            # asyncio.shield 防止取消信号打断 Redis 写入; shield 内部任务
-            # 即使外层被取消也会在后台完成。
+            AgentscopeService._unregister_task(session_id)
+            try:
+                self.msg_service.save_assistant_message(
+                    conversation.id, full_response, assistant_msg,
+                )
+                # 显式提交, 不依赖 get_db() 的延迟提交。
+                # 中断后请求可能被取消, get_db() 的 commit 不会执行反而可能
+                # rollback, 导致已 flush 的消息丢失。
+                if self.db.is_active:
+                    self.db.commit()
+            except Exception:
+                logger.exception("保存助手消息/提交失败")
+                try:
+                    if self.db.is_active:
+                        self.db.rollback()
+                except Exception:
+                    pass
+            # 持久化 state 到 Redis; shield 防止取消信号打断写入。
             try:
                 await asyncio.shield(
                     AgentService.save_state(session_id, agent.state),
@@ -189,20 +206,6 @@ class ChatService:
                 )
             except Exception:
                 logger.exception("save_state 异常")
-            try:
-                self.msg_service.save_assistant_message(
-                    conversation.id, full_response, assistant_msg,
-                )
-                # 显式提交, 不依赖 get_db() 的延迟提交。
-                # 中断后请求可能被取消, get_db() 的 commit 不会执行反而可能
-                # rollback, 导致已 flush 的消息丢失。
-                self.db.commit()
-            except Exception:
-                logger.exception("保存助手消息/提交失败")
-                try:
-                    self.db.rollback()
-                except Exception:
-                    pass
 
     async def handle_conversation(self, user_message: str, conversation_id: str | None = None, user_id: str = "default_user") \
             -> tuple[Conversation, Message]:
@@ -233,7 +236,7 @@ class ChatService:
             dict: 中断结果, 含 status / conversation_id / reason。
         """
         # 1. 取消正在运行的回复任务, 等待其 finally 持久化完成
-        task = ChatService._running_tasks.get(conversation_id)
+        task = AgentscopeService._running_tasks.get(conversation_id)
         if task is not None and not task.done():
             task.cancel()
             try:
@@ -247,7 +250,7 @@ class ChatService:
                 )
             # 在 await 之后才注销, 避免"继续"请求在 finally 未完成时就
             # 进入, 导致 DB 中 conversation 未提交而创建重复记录。
-            ChatService._unregister_task(conversation_id)
+            AgentscopeService._unregister_task(conversation_id)
             logger.info("已中断运行中的对话 | conversation_id=%s", conversation_id)
             return {
                 "status": "interrupted",
@@ -341,6 +344,7 @@ class ChatService:
         session_id = conversation.id
 
         # 仅当有新消息时保存用户消息
+        message = None
         if user_message:
             message = self.msg_service.save_message(
                 conversation_id=conversation.id,
@@ -354,6 +358,7 @@ class ChatService:
                 content=json.dumps(confirm_results, ensure_ascii=False),
                 event_type="tool_confirmation",
             )
+        message_id = message.id if message else None
 
         # 加载状态，使用 DEFAULT 模式（需要权限确认）
         state = await AgentService.load_state(session_id)
@@ -362,7 +367,7 @@ class ChatService:
                 session_id=session_id,
                 permission_context=PermissionContext(mode=PermissionMode.DEFAULT),
             )
-            history = self._load_history(conversation.id, message.id)
+            history = self._load_history(conversation.id, message_id)
             if history:
                 agent_temp = await AgentService.create_agent_with_state(state)
                 await agent_temp.observe(history)
@@ -386,8 +391,6 @@ class ChatService:
         yield {"event": "conversation_id", "data": {"conversation_id": conversation.id}}
 
         assistant_msg = None
-        _open_thinking_blocks: set[str] = set()
-        _pending_events: list[dict] = []
 
         try:
             async for event in agent.reply_stream(agent_input):
@@ -402,11 +405,9 @@ class ChatService:
                 if mapped is None:
                     continue
 
-                for ordered in self._reorder_event(
-                    mapped, _open_thinking_blocks, _pending_events,
-                ):
-                    full_response.append(ordered)
-                    yield ordered
+                full_response.append(mapped)
+                yield mapped
+
         except Exception as e:
             yield {"event": "error", "data": {"message": str(e)}}
             return
@@ -436,10 +437,10 @@ class ChatService:
     ):
         """根据请求类型构建 agent.reply_stream 的输入参数"""
         if confirm_results:
-            return ChatService._build_confirm_input(agent, confirm_results)
+            return AgentscopeService._build_confirm_input(agent, confirm_results)
 
         if user_message:
-            return ChatService._build_user_input(agent, user_message, user_id)
+            return AgentscopeService._build_user_input(agent, user_message, user_id)
 
         return None
 
@@ -518,45 +519,6 @@ class ChatService:
                 else:
                     history.append(AssistantMsg(name="assistant", content=msg.content))
         return history
-
-    @staticmethod
-    def _reorder_event(
-        mapped: dict | None,
-        open_thinking_blocks: set[str],
-        pending_events: list[dict],
-    ) -> list[dict]:
-        """对事件进行重排序: 在 thinking block 未关闭之前, 缓冲 text block 事件;
-        待 thinking_block_end 到达且所有 thinking block 关闭后, 按序输出缓冲区内容."""
-        if mapped is None:
-            return []
-
-        event_type: str = mapped["event"]
-        block_id: str | None = (mapped.get("data") or {}).get("block_id")
-
-        if event_type == "thinking_block_start":
-            if block_id:
-                open_thinking_blocks.add(block_id)
-            return [mapped]
-
-        if event_type == "thinking_block_end":
-            if block_id:
-                open_thinking_blocks.discard(block_id)
-            if not open_thinking_blocks and pending_events:
-                result = [mapped]
-                result.extend(pending_events)
-                pending_events.clear()
-                return result
-            return [mapped]
-
-        if open_thinking_blocks and event_type in (
-            "text_block_start",
-            "text_block_delta",
-            "text_block_end",
-        ):
-            pending_events.append(mapped)
-            return []
-
-        return [mapped]
 
     def _map_event(self, event) -> dict | None:
         event_name = event.type.value.lower()

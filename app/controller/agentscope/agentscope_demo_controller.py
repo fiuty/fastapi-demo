@@ -5,31 +5,32 @@ import json
 import logging
 from typing import AsyncGenerator
 
+from agentscope.app.deps import get_chat_service
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.model.message import ChatRequest, ChatInteractiveRequest, InterruptRequest
-from app.service.agentscope.chat_service import ChatService
+from app.service.agentscope.agentscope_service import AgentscopeService
 
 logger = logging.getLogger("agentscope")
 
 router = APIRouter(prefix="/api/agentscope", tags=["AgentScope 对话"])
 
 
-def get_chat_service(db: Session = Depends(get_db)) -> ChatService:
-    return ChatService(db)
+def get_agentscope_service(db: Session = Depends(get_db)) -> AgentscopeService:
+    return AgentscopeService(db)
 
 
 @router.post("/chat/stream", summary="流式对话(SSE)")
 async def chat_stream(
     request: ChatRequest,
-    chat_service: ChatService = Depends(get_chat_service),
+    agentscope_service: AgentscopeService = Depends(get_agentscope_service),
 ):
     async def event_generator() -> AsyncGenerator[str, None]:
         try:
-            async for sse_event in chat_service.chat_stream(
+            async for sse_event in agentscope_service.chat_stream(
                 user_message=request.message,
                 conversation_id=request.conversation_id,
             ):
@@ -55,7 +56,7 @@ async def chat_stream(
 @router.post("/chat/interrupt", summary="中断对话(运行中或暂停中)")
 async def chat_interrupt(
     request: InterruptRequest,
-    chat_service: ChatService = Depends(get_chat_service),
+    chat_service: AgentscopeService = Depends(get_chat_service),
 ):
     """中断指定会话的智能体回复。
 
@@ -74,7 +75,7 @@ async def chat_interrupt(
 @router.post("/chat/stream/interactive", summary="交互式流式对话(SSE, 含工具权限确认)")
 async def chat_stream_interactive(
     request: ChatInteractiveRequest,
-    chat_service: ChatService = Depends(get_chat_service),
+    chat_service: AgentscopeService = Depends(get_chat_service),
 ):
     async def event_generator() -> AsyncGenerator[str, None]:
         try:
