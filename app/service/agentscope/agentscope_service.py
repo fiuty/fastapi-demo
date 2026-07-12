@@ -4,8 +4,11 @@ AgentscopeService: Agent 流式对话服务
 使用全局 Agent + RedisStorage 持久化 AgentState 实现多会话隔离
 
 支持对话中断与恢复:
-- 中断运行中的回复: 取消承载 reply_stream 的 asyncio.Task, Agent 内部捕获
-  CancelledError 后清理上下文并产出 INTERRUPTED 结束事件, 上下文保持一致。
+- 中断运行中的回复: 设置 interrupt_event 让 _interruptible_agent_stream
+  取消 __anext__() 任务, 将 CancelledError 精确注入 Agent 的 reply_stream
+  生成器。Agent 内部捕获后清理上下文并产出 INTERRUPTED 结束事件。
+  task.cancel() 作为兜底。直接 task.cancel() 不可靠: CancelledError 落在
+  HTTP 客户端或 Starlette send() 中无法到达 Agent 生成器。
 - 中断暂停中的回复(等待用户确认/外部执行): 通过 UserInterruptEvent 清理待处理工具调用。
 - 恢复: 携带 conversation_id 再次调用 chat_stream 即可, 历史消息与状态从
   Redis/DB 恢复, 不会丢失。
@@ -59,8 +62,7 @@ class AgentscopeService:
 
     # 会话 ID -> 正在运行的 reply 任务, 供中断接口取消
     _running_tasks: dict[str, asyncio.Task] = {}
-    # 会话 ID -> 中断信号 Event, 解决 CancelledError 在嵌套 async generator 中
-    # 被 model._stream() 吞掉后无法打断 Agent 推理循环的问题
+    # 会话 ID -> 中断信号 Event, 用于将 CancelledError 精确注入 Agent 生成器
     _interrupt_events: dict[str, asyncio.Event] = {}
 
     def __init__(self, db: Session):
@@ -83,6 +85,7 @@ class AgentscopeService:
 
     @classmethod
     def _get_interrupt_event(cls, session_id: str) -> asyncio.Event:
+        """获取(或创建)会话的中断信号 Event"""
         event = cls._interrupt_events.get(session_id)
         if event is None:
             event = asyncio.Event()
@@ -163,10 +166,9 @@ class AgentscopeService:
             user_message, user_id, session_id,
         )
 
-        # 7. 注册当前请求任务, 供中断接口通过 task.cancel() 取消。
-        #    直接迭代 agent.reply_stream, CancelledError 会被 Agent 内部
-        #    (model._stream / _reply_impl) 捕获并产出 INTERRUPTED 结束事件,
-        #    随后 async for 正常结束, 进入 finally 持久化。
+        # 7. 注册当前请求任务与中断信号。
+        #    interrupt_event 用于 _interruptible_agent_stream 将 CancelledError
+        #    精确注入 Agent 生成器; task.cancel() 作为兜底。
         current_task = asyncio.current_task()
         if current_task is not None:
             AgentscopeService._register_task(session_id, current_task)
@@ -388,32 +390,24 @@ class AgentscopeService:
     ) -> dict:
         """取消运行中的回复任务并等待其清理完成。
 
-        先设置中断 Event, 确保 chat_stream 的 _interruptible_agent_stream
-        能在 CancelledError 被 model._stream() 吞掉时仍感知到中断。
+        先设置中断 Event, 让 _interruptible_agent_stream 取消 __anext__()
+        任务, 将 CancelledError 精确注入 Agent 的 reply_stream 生成器,
+        触发 SDK 中断清理路径。task.cancel() 作为兜底, 确保即使中断信号
+        未被及时消费, 任务也能被取消。
 
-        取消后等待任务 finally 持久化(通常 < 1s), 在 await 之后才注销,
-        避免"继续"请求在 finally 未完成时就进入, 导致 DB 中 conversation
-        未提交而创建重复记录。最大等待 10 秒, 超时则返回但不影响清理
-        (任务最终仍会完成)。
+        等待最多 10s 确保 DB 已提交, 避免后续"继续"请求因 conversation
+        未提交而创建重复记录。
         """
-        # 先设置中断 Event, 确保 chat_stream 的 _interruptible_agent_stream
-        # 能在 CancelledError 被 model._stream() 吞掉时仍感知到中断
         interrupt_event = cls._get_interrupt_event(conversation_id)
         interrupt_event.set()
         task.cancel()
         try:
-            # 直接迭代模式下 CancelledError 会快速传播到 Agent,
-            # Agent 内部捕获后 finally 持久化 state/消息, 通常 < 1s。
             await asyncio.wait_for(task, timeout=10)
         except (asyncio.CancelledError, Exception):
-            # CancelledError 属于 BaseException, 需单独捕获;
-            # Exception 已覆盖 TimeoutError, 无需重复列出。
             logger.warning(
                 "等待中断清理超时或异常 | conversation_id=%s",
                 conversation_id,
             )
-        # 在 await 之后才注销, 避免"继续"请求在 finally 未完成时就进入,
-        # 导致 DB 中 conversation 未提交而创建重复记录。
         cls._unregister_task(conversation_id)
         logger.info("已中断运行中的对话 | conversation_id=%s", conversation_id)
         return cls._build_interrupt_result(
@@ -726,57 +720,51 @@ class AgentscopeService:
         agent_gen: AsyncGenerator,
         interrupt_event: asyncio.Event,
     ) -> AsyncGenerator:
-        """包装 Agent 流, 在每个 agent event 之间检查中断信号。
+        """包装 Agent 流, 支持 interrupt_event 即时中断。
 
-        解决 task.cancel() 发出的 CancelledError 在嵌套 async generator
-        (model._stream → _reasoning_impl → _reply_impl) 中被吞掉后,
-        Agent 推理循环无法感知中断, 继续调用模型输出内容的问题。
+        通过 asyncio.wait 将 agent_gen.__anext__() 与 interrupt_event.wait()
+        竞争。中断信号触发时取消 __anext__() 任务, 将 CancelledError 精确
+        注入 Agent 的 reply_stream 生成器, 触发 SDK 中断清理路径
+        (_reply_impl except CancelledError -> INTERRUPTED 结束事件)。
 
-        当 interrupt_event 被 set 时, 主动向 agent_gen 注入
-        CancelledError, 让 Agent 的 _reply_impl 走中断清理路径
-        (yield 工具结果事件 + ReplyEndEvent(INTERRUPTED)), 然后正常结束流。
+        必要性: task.cancel() 取消整个请求任务, CancelledError 可能落在
+        HTTP 客户端或 Starlette send() 中, 无法可靠到达 Agent 生成器。
+        通过独立任务包装 __anext__(), cancel() 可将 CancelledError 直接
+        throw 到 reply_stream 生成器的当前 await 点。
         """
-        try:
-            while True:
-                get_next = asyncio.ensure_future(agent_gen.__anext__())
-                wait_interrupt = asyncio.ensure_future(
-                    interrupt_event.wait(),
-                )
+        while True:
+            get_next = asyncio.ensure_future(agent_gen.__anext__())
+            wait_interrupt = asyncio.ensure_future(interrupt_event.wait())
+            try:
                 done, pending = await asyncio.wait(
                     [get_next, wait_interrupt],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if get_next in done:
-                    event = get_next.result()
-                    yield event
-                    for t in pending:
-                        t.cancel()
-                else:
-                    # 中断信号触发: 取消当前 __anext__, 注入 CancelledError
-                    # Agent 的 _reply_impl / model._stream 会捕获并清理,
-                    # 然后 yield ReplyEndEvent(INTERRUPTED) 结束生成器。
-                    get_next.cancel()
-                    # 排空 Agent 清理过程中产生的所有剩余事件
-                    interrupted_event = None
-                    try:
-                        interrupted_event = await get_next
-                    except (StopAsyncIteration, asyncio.CancelledError):
-                        pass
-                    for t in pending:
-                        t.cancel()
-                    if interrupted_event is not None:
-                        yield interrupted_event
-                    try:
-                        async for event in agent_gen:
-                            yield event
-                    except (StopAsyncIteration, asyncio.CancelledError):
-                        pass
+            except asyncio.CancelledError:
+                # 外部 task.cancel() 传播, 清理后重抛
+                get_next.cancel()
+                wait_interrupt.cancel()
+                raise
+
+            if get_next in done:
+                # 正常收到 Agent 事件
+                wait_interrupt.cancel()
+                try:
+                    yield get_next.result()
+                except StopAsyncIteration:
                     return
-        except StopAsyncIteration:
-            return
-        except asyncio.CancelledError:
-            # 允许外部 task.cancel() 正常传播
-            raise
+            else:
+                # 中断信号触发: 取消 __anext__(), 将 CancelledError 注入 Agent。
+                # SDK 捕获后产出 INTERRUPTED 清理事件, 排空后正常结束。
+                wait_interrupt.cancel()
+                get_next.cancel()
+                try:
+                    yield await get_next
+                except (StopAsyncIteration, asyncio.CancelledError):
+                    pass
+                async for event in agent_gen:
+                    yield event
+                return
 
     def _map_event(self, event) -> dict | None:
         event_name = event.type.value.lower()
