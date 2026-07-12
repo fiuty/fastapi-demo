@@ -60,6 +60,20 @@ class ConversationService:
             setattr(conv, key, value)
         return self.conversation_dao.update(conv)
 
+    def resolve_conversation(
+        self,
+        conversation_id: str | None,
+        title: str,
+        user_id: str,
+    ) -> Conversation:
+        """根据 conversation_id 查找会话，不存在则创建"""
+        if conversation_id is not None:
+            conv = self.conversation_dao.get_by_id(conversation_id)
+            if conv is not None:
+                return conv
+        conv = Conversation(user_id=user_id, title=title)
+        return self.conversation_dao.insert(conv)
+
     async def delete_conversation(self, conversation_id: str) -> None:
         conv = self.get_conversation(conversation_id)
         await AgentService.remove_state(conv.id)

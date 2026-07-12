@@ -48,7 +48,7 @@ from agentscope.message import Msg, UserMsg, AssistantMsg
 from agentscope.message._block import ToolCallState
 from agentscope.state import AgentState
 
-from app.model.conversation import Conversation
+from app.model import Conversation
 from app.model.message import Message
 from app.service.agentscope.agent_service import AgentService
 
@@ -62,6 +62,10 @@ class ChatService:
 
     def __init__(self, db: Session):
         self.db = db
+        from app.service.conversation_service import ConversationService
+        from app.service.message_service import MessageService
+        self.conv_service = ConversationService(db)
+        self.msg_service = MessageService(db)
 
     # ======================== 运行任务注册表 ========================
 
@@ -96,20 +100,10 @@ class ChatService:
         conversation_id: str | None = None,
         user_id: str = "default_user",
     ) -> AsyncGenerator[dict, None]:
-        conversation = self._resolve_conversation(
-            conversation_id, user_message[:30], user_id,
-        )
+        conversation, message = self.handle_conversation(user_message, conversation_id, user_id)
         session_id = conversation.id
-
         # 若同会话存在尚未结束的回复, 取消并等待其清理完成后再继续
         await ChatService._cancel_running_task(session_id)
-
-        # 保存用户消息到 DB
-        self._save_message(
-            conversation_id=conversation.id,
-            role="user",
-            content=user_message,
-        )
 
         # 从 Redis 加载会话状态; 过期/不存在则从 DB 恢复历史消息后重建
         state = await AgentService.load_state(session_id)
@@ -118,7 +112,7 @@ class ChatService:
                 session_id=session_id,
                 permission_context=PermissionContext(mode=PermissionMode.BYPASS),
             )
-            history = self._load_history(conversation.id)
+            history = self._load_history(conversation.id, message.id)
             if history:
                 agent_temp = await AgentService.create_agent_with_state(state)
                 await agent_temp.observe(history)
@@ -197,7 +191,7 @@ class ChatService:
             except Exception:
                 logger.exception("save_state 异常")
             try:
-                self._save_assistant_message(
+                self.msg_service.save_assistant_message(
                     conversation.id, full_response, assistant_msg,
                 )
                 # 显式提交, 不依赖 get_db() 的延迟提交。
@@ -210,6 +204,14 @@ class ChatService:
                     self.db.rollback()
                 except Exception:
                     pass
+
+    async def handle_conversation(self, user_message: str, conversation_id: str | None = None, user_id: str = "default_user") \
+            -> tuple[Conversation, Message]:
+        conversation = self.conv_service.resolve_conversation(conversation_id, user_message[:30], user_id,)
+        # 保存用户消息到 DB
+        message = self.msg_service.save_message(conversation_id=conversation.id, role="user", content=user_message)
+        return conversation, message
+
 
     async def interrupt(self, conversation_id: str) -> dict:
         """中断指定会话的智能体回复。
@@ -290,7 +292,7 @@ class ChatService:
                     full_response.append(mapped)
 
             await AgentService.save_state(conversation_id, agent.state)
-            self._save_assistant_message(conversation_id, full_response, assistant_msg)
+            self.msg_service.save_assistant_message(conversation_id, full_response, assistant_msg)
             try:
                 self.db.commit()
             except Exception:
@@ -332,7 +334,7 @@ class ChatService:
         2. 客户端发送 {"confirm_results": [{"tool_call_id": "...", "confirmed": true}]} → 继续流式返回
         """
         full_response: list[dict] = []
-        conversation = self._resolve_conversation(
+        conversation = self.conv_service.resolve_conversation(
             conversation_id,
             (user_message or "tool confirmation")[:30],
             user_id,
@@ -341,13 +343,13 @@ class ChatService:
 
         # 仅当有新消息时保存用户消息
         if user_message:
-            self._save_message(
+            message = self.msg_service.save_message(
                 conversation_id=conversation.id,
                 role="user",
                 content=user_message,
             )
         elif confirm_results:
-            self._save_message(
+            message = self.msg_service.save_message(
                 conversation_id=conversation.id,
                 role="user",
                 content=json.dumps(confirm_results, ensure_ascii=False),
@@ -361,7 +363,7 @@ class ChatService:
                 session_id=session_id,
                 permission_context=PermissionContext(mode=PermissionMode.DEFAULT),
             )
-            history = self._load_history(conversation.id)
+            history = self._load_history(conversation.id, message.id)
             if history:
                 agent_temp = await AgentService.create_agent_with_state(state)
                 await agent_temp.observe(history)
@@ -411,7 +413,7 @@ class ChatService:
             return
         finally:
             await AgentService.save_state(session_id, agent.state)
-            self._save_assistant_message(
+            self.msg_service.save_assistant_message(
                 conversation.id,
                 full_response,
                 assistant_msg,
@@ -499,70 +501,11 @@ class ChatService:
 
         return UserMsg(name=user_id, content=user_message)
 
-    def _resolve_conversation(
-        self,
-        conversation_id: str | None,
-        title: str,
-        user_id: str,
-    ) -> Conversation:
-        """根据 conversation_id (主键) 查找会话, 不存在则创建"""
-        if conversation_id is not None:
-            conv = self.db.get(Conversation, conversation_id)
-            if conv is not None:
-                return conv
-        # 不存在或未传 conversation_id, 创建新会话 (id 由模型 default 自动生成 UUID)
-        conv = Conversation(user_id=user_id, title=title)
-        self.db.add(conv)
-        self.db.flush()
-        self.db.refresh(conv)
-        return conv
-
-    def _save_message(
-        self,
-        conversation_id: str,
-        role: str,
-        content: str,
-        event_type: str | None = None,
-        extra_meta: str | None = None,
-    ) -> Message:
-        msg = Message(
-            conversation_id=conversation_id,
-            role=role,
-            content=content,
-            event_type=event_type,
-            extra_meta=extra_meta,
-        )
-        self.db.add(msg)
-        self.db.flush()
-        self.db.refresh(msg)
-        return msg
-
-    def _save_assistant_message(
-        self,
-        conversation_id: str,
-        full_response: list[dict],
-        assistant_msg: Msg | None,
-    ) -> str | None:
-        """持久化助手回复事件列表, 返回 message_id"""
-        if not full_response:
-            return None
-        try:
-            db_msg = self._save_message(
-                conversation_id=conversation_id,
-                role="assistant",
-                content=json.dumps(full_response, ensure_ascii=False),
-                extra_meta=assistant_msg.model_dump_json() if assistant_msg else None,
-            )
-            return db_msg.id
-        except Exception as ex:
-            logger.warning("保存助手回复失败 | conversation_id=%s | error=%s", conversation_id, ex)
-            return None
-
-    def _load_history(self, conversation_id: str) -> list[Msg]:
+    def _load_history(self, conversation_id: str, current_msg_id: str | None = None) -> list[Msg]:
         from sqlalchemy import select
         stmt = (
             select(Message)
-            .where(Message.conversation_id == conversation_id)
+            .where(Message.conversation_id == conversation_id, Message.id != current_msg_id)
             .order_by(Message.create_time.asc())
         )
         messages = list(self.db.execute(stmt).scalars().all())
