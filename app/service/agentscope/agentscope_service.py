@@ -49,6 +49,7 @@ from agentscope.state import AgentState
 
 from app.pojo import Conversation
 from app.pojo import Message
+from app.common.exception import BizException
 from app.service.agentscope.agent_service import AgentService
 
 logger = logging.getLogger("agentscope")
@@ -123,12 +124,40 @@ class AgentscopeService:
 
     async def chat_stream(
         self,
-        user_message: str,
+        user_message: str | None,
         conversation_id: str | None = None,
         user_id: str = "default_user",
     ) -> AsyncGenerator[dict, None]:
-        conversation, message = self.handle_conversation(user_message, conversation_id, user_id)
-        session_id = conversation.id
+        """流式对话, 支持新消息对话和恢复中断会话。
+
+        Args:
+            user_message: 用户消息内容. 为 None 时表示恢复中断的会话,
+                          此时必须提供 conversation_id.
+            conversation_id: 会话 ID.
+            user_id: 用户标识.
+        """
+        # ---- 恢复模式 ----
+        if user_message is None:
+            if not conversation_id:
+                yield {
+                    "event": "error",
+                    "data": {"message": "恢复会话必须提供 conversation_id"},
+                }
+                return
+            try:
+                conversation = self.conv_service.get_conversation(conversation_id)
+            except BizException:
+                yield {
+                    "event": "error",
+                    "data": {"message": f"会话不存在: {conversation_id}"},
+                }
+                return
+            session_id = conversation.id
+            message = None
+        else:
+            conversation, message = self.handle_conversation(user_message, conversation_id, user_id)
+            session_id = conversation.id
+
         # 若同会话存在尚未结束的回复, 取消并等待其清理完成后再继续
         await AgentscopeService._cancel_running_task(session_id)
 
@@ -139,7 +168,7 @@ class AgentscopeService:
                 session_id=session_id,
                 permission_context=PermissionContext(mode=PermissionMode.BYPASS),
             )
-            history = self._load_history(conversation.id, message.id)
+            history = self._load_history(conversation.id, message.id if message else None)
             if history:
                 agent_temp = await AgentService.create_agent_with_state(state)
                 await agent_temp.observe(history)
@@ -154,8 +183,13 @@ class AgentscopeService:
         # 自动确认上一轮遗留的 pending ASKING 工具调用, 避免统一会话一直等到工具调用结果
         AgentscopeService._auto_confirm_pending_tool_calls(agent)
 
-        # 只传新消息, agent.state.context 会自动累积
-        user_msg = UserMsg(name=user_id, content=user_message)
+        # 构建 agent 输入: 恢复模式传 None, 新消息模式传 UserMsg
+        if user_message is not None:
+            agent_input = UserMsg(name=user_id, content=user_message)
+        else:
+            # agent.reply_stream(None) 从当前上下文继续推理, 不添加新消息
+            logger.info("恢复中断会话 | session_id=%s", session_id)
+            agent_input = None
 
         # 注册当前请求任务, 供中断接口通过 task.cancel() 取消。
         # 直接迭代 agent.reply_stream, CancelledError 会被 Agent 内部
@@ -171,7 +205,7 @@ class AgentscopeService:
 
         try:
             async for event in self._interruptible_agent_stream(
-                agent.reply_stream(user_msg), interrupt_event,
+                agent.reply_stream(agent_input), interrupt_event,
             ):
                 if isinstance(event, ReplyStartEvent):
                     assistant_msg = AssistantMsg(

@@ -28,7 +28,7 @@ class MessageVO(BaseModel):
 
 class ChatRequest(BaseModel):
     conversation_id: Optional[str] = Field(default=None, description="会话ID, 不传则创建新会话")
-    message: str = Field(..., min_length=1, description="用户消息")
+    message: Optional[str] = Field(default=None, description="用户消息，不传则恢复中断的会话继续推理")
 
 
 class ConfirmResultItem(BaseModel):
