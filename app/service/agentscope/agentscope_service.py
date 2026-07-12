@@ -58,6 +58,9 @@ class AgentscopeService:
 
     # 会话 ID -> 正在运行的 reply 任务, 供中断接口取消
     _running_tasks: dict[str, asyncio.Task] = {}
+    # 会话 ID -> 中断信号 Event, 解决 CancelledError 在嵌套 async generator 中
+    # 被 model._stream() 吞掉后无法打断 Agent 推理循环的问题
+    _interrupt_events: dict[str, asyncio.Event] = {}
 
     def __init__(self, db: Session):
         self.db = db
@@ -76,6 +79,18 @@ class AgentscopeService:
     @classmethod
     def _unregister_task(cls, session_id: str) -> None:
         cls._running_tasks.pop(session_id, None)
+
+    @classmethod
+    def _get_interrupt_event(cls, session_id: str) -> asyncio.Event:
+        event = cls._interrupt_events.get(session_id)
+        if event is None:
+            event = asyncio.Event()
+            cls._interrupt_events[session_id] = event
+        return event
+
+    @classmethod
+    def _clear_interrupt_event(cls, session_id: str) -> None:
+        cls._interrupt_events.pop(session_id, None)
 
     @classmethod
     async def _cancel_running_task(cls, session_id: str) -> None:
@@ -112,7 +127,7 @@ class AgentscopeService:
         conversation_id: str | None = None,
         user_id: str = "default_user",
     ) -> AsyncGenerator[dict, None]:
-        conversation, message = await self.handle_conversation(user_message, conversation_id, user_id)
+        conversation, message = self.handle_conversation(user_message, conversation_id, user_id)
         session_id = conversation.id
         # 若同会话存在尚未结束的回复, 取消并等待其清理完成后再继续
         await AgentscopeService._cancel_running_task(session_id)
@@ -152,9 +167,12 @@ class AgentscopeService:
 
         full_response: list[dict] = []
         assistant_msg: Msg | None = None
+        interrupt_event = AgentscopeService._get_interrupt_event(session_id)
 
         try:
-            async for event in agent.reply_stream(user_msg):
+            async for event in self._interruptible_agent_stream(
+                agent.reply_stream(user_msg), interrupt_event,
+            ):
                 if isinstance(event, ReplyStartEvent):
                     assistant_msg = AssistantMsg(
                         name=event.name, content=[], id=event.reply_id,
@@ -178,6 +196,7 @@ class AgentscopeService:
             yield {"event": "error", "data": {"message": str(e)}}
         finally:
             AgentscopeService._unregister_task(session_id)
+            AgentscopeService._clear_interrupt_event(session_id)
             try:
                 self.msg_service.save_assistant_message(
                     conversation.id, full_response, assistant_msg,
@@ -207,7 +226,7 @@ class AgentscopeService:
             except Exception:
                 logger.exception("save_state 异常")
 
-    async def handle_conversation(self, user_message: str, conversation_id: str | None = None, user_id: str = "default_user") \
+    def handle_conversation(self, user_message: str, conversation_id: str | None = None, user_id: str = "default_user") \
             -> tuple[Conversation, Message]:
         conversation = self.conv_service.resolve_conversation(conversation_id, user_message[:30], user_id,)
         # 保存用户消息到 DB
@@ -238,6 +257,10 @@ class AgentscopeService:
         # 1. 取消正在运行的回复任务, 等待其 finally 持久化完成
         task = AgentscopeService._running_tasks.get(conversation_id)
         if task is not None and not task.done():
+            # 先设置中断 Event, 确保 chat_stream 的 _interruptible_agent_stream
+            # 能在 CancelledError 被 model._stream() 吞掉时仍感知到中断
+            interrupt_event = AgentscopeService._get_interrupt_event(conversation_id)
+            interrupt_event.set()
             task.cancel()
             try:
                 # 直接迭代模式下 CancelledError 会快速传播到 Agent,
@@ -519,6 +542,63 @@ class AgentscopeService:
                 else:
                     history.append(AssistantMsg(name="assistant", content=msg.content))
         return history
+
+    @staticmethod
+    async def _interruptible_agent_stream(
+        agent_gen: AsyncGenerator,
+        interrupt_event: asyncio.Event,
+    ) -> AsyncGenerator:
+        """包装 Agent 流, 在每个 agent event 之间检查中断信号。
+
+        解决 task.cancel() 发出的 CancelledError 在嵌套 async generator
+        (model._stream → _reasoning_impl → _reply_impl) 中被吞掉后,
+        Agent 推理循环无法感知中断, 继续调用模型输出内容的问题。
+
+        当 interrupt_event 被 set 时, 主动向 agent_gen 注入
+        CancelledError, 让 Agent 的 _reply_impl 走中断清理路径
+        (yield 工具结果事件 + ReplyEndEvent(INTERRUPTED)), 然后正常结束流。
+        """
+        try:
+            while True:
+                get_next = asyncio.ensure_future(agent_gen.__anext__())
+                wait_interrupt = asyncio.ensure_future(
+                    interrupt_event.wait(),
+                )
+                done, pending = await asyncio.wait(
+                    [get_next, wait_interrupt],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if get_next in done:
+                    event = get_next.result()
+                    yield event
+                    for t in pending:
+                        t.cancel()
+                else:
+                    # 中断信号触发: 取消当前 __anext__, 注入 CancelledError
+                    # Agent 的 _reply_impl / model._stream 会捕获并清理,
+                    # 然后 yield ReplyEndEvent(INTERRUPTED) 结束生成器。
+                    get_next.cancel()
+                    # 排空 Agent 清理过程中产生的所有剩余事件
+                    interrupted_event = None
+                    try:
+                        interrupted_event = await get_next
+                    except (StopAsyncIteration, asyncio.CancelledError):
+                        pass
+                    for t in pending:
+                        t.cancel()
+                    if interrupted_event is not None:
+                        yield interrupted_event
+                    try:
+                        async for event in agent_gen:
+                            yield event
+                    except (StopAsyncIteration, asyncio.CancelledError):
+                        pass
+                    return
+        except StopAsyncIteration:
+            return
+        except asyncio.CancelledError:
+            # 允许外部 task.cancel() 正常传播
+            raise
 
     def _map_event(self, event) -> dict | None:
         event_name = event.type.value.lower()

@@ -56,7 +56,7 @@ async def chat_stream(
 @router.post("/chat/interrupt", summary="中断对话(运行中或暂停中)")
 async def chat_interrupt(
     request: InterruptRequest,
-    chat_service: AgentscopeService = Depends(get_chat_service),
+    agentscope_service: AgentscopeService = Depends(get_agentscope_service),
 ):
     """中断指定会话的智能体回复。
 
@@ -68,14 +68,14 @@ async def chat_interrupt(
     中断后 state 与(部分)消息已持久化, 携带 conversation_id 再次调用
     ``/chat/stream`` 即可恢复会话, 历史消息不丢失。
     """
-    result = await chat_service.interrupt(request.conversation_id)
+    result = await agentscope_service.interrupt(request.conversation_id)
     return result
 
 
 @router.post("/chat/stream/interactive", summary="交互式流式对话(SSE, 含工具权限确认)")
 async def chat_stream_interactive(
     request: ChatInteractiveRequest,
-    chat_service: AgentscopeService = Depends(get_chat_service),
+    agentscope_service: AgentscopeService = Depends(get_agentscope_service),
 ):
     async def event_generator() -> AsyncGenerator[str, None]:
         try:
@@ -90,7 +90,7 @@ async def chat_stream_interactive(
                     for r in request.confirm_results
                 ]
 
-            async for sse_event in chat_service.chat_stream_interactive(
+            async for sse_event in agentscope_service.chat_stream_interactive(
                 user_message=request.message,
                 confirm_results=confirm_results,
                 conversation_id=request.conversation_id,
