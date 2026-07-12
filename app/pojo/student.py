@@ -1,57 +1,52 @@
 """
-pojo 层: Pydantic 数据校验/序列化模型
-对应 Java 中的 DTO/VO/Form
-- StudentCreate:  新增学生表单 (类似 @RequestBody AddStudentForm)
-- StudentUpdate:  修改学生表单 (类似 @RequestBody UpdateStudentForm)
-- StudentVO:      返回给前端的视图对象 (类似 VO/Resp)
-- StudentQuery:   查询条件 (类似 Query 类的字段)
+学生 ORM 模型
+对应 MyBatis-Plus 中的 @TableName("t_student") Student 实体
 """
 from datetime import datetime
-from typing import Optional
 
-from pydantic import BaseModel, Field, ConfigDict
+from sqlalchemy import Integer, String, DateTime, func
+from sqlalchemy.orm import Mapped, mapped_column
 
-
-class StudentBase(BaseModel):
-    """学生基础字段 (Create 和 Update 共用)"""
-    name: str = Field(..., min_length=1, max_length=50, description="姓名")
-    student_no: str = Field(..., min_length=1, max_length=20, description="学号")
-    age: int = Field(..., ge=1, le=200, description="年龄")
-    gender: str = Field(default="未知", max_length=10, description="性别")
-    clazz: str = Field(..., min_length=1, max_length=50, description="班级")
-    email: Optional[str] = Field(default=None, max_length=100, description="邮箱")
+from app.database import Base
 
 
-class StudentCreate(StudentBase):
-    """新增学生请求体"""
-    pass
+class Student(Base):
+    """
+    学生表
+    SQLAlchemy 2.0 风格: 用 Mapped[] + mapped_column() 做类型注解
+    等价于 Java 的:
+        @Data
+        @TableName("t_student")
+        public class Student {
+            @TableId(type = IdType.AUTO)
+            private Long id;
+            private String name;
+            private String studentNo;
+            private Integer age;
+            private String gender;
+            private String clazz;
+            @TableField(fill = FieldFill.INSERT)
+            private LocalDateTime createTime;
+            @TableField(fill = FieldFill.INSERT_UPDATE)
+            private LocalDateTime updateTime;
+        }
+    """
+    __tablename__ = "t_student"
 
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, comment="主键ID")
+    name: Mapped[str] = mapped_column(String(50), nullable=False, comment="姓名")
+    student_no: Mapped[str] = mapped_column(String(20), unique=True, index=True, nullable=False, comment="学号")
+    age: Mapped[int] = mapped_column(Integer, nullable=False, comment="年龄")
+    gender: Mapped[str] = mapped_column(String(10), nullable=False, default="未知", comment="性别")
+    clazz: Mapped[str] = mapped_column(String(50), nullable=False, comment="班级")
+    email: Mapped[str | None] = mapped_column(String(100), nullable=True, comment="邮箱")
 
-class StudentUpdate(BaseModel):
-    """修改学生请求体 (所有字段可选, 局部更新)"""
-    name: Optional[str] = Field(default=None, min_length=1, max_length=50)
-    student_no: Optional[str] = Field(default=None, min_length=1, max_length=20)
-    age: Optional[int] = Field(default=None, ge=1, le=200)
-    gender: Optional[str] = Field(default=None, max_length=10)
-    clazz: Optional[str] = Field(default=None, min_length=1, max_length=50)
-    email: Optional[str] = Field(default=None, max_length=100)
+    create_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False, comment="创建时间"
+    )
+    update_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now(), nullable=False, comment="更新时间"
+    )
 
-
-class StudentVO(StudentBase):
-    """学生响应 VO"""
-    id: int
-    create_time: datetime
-    update_time: datetime
-
-    # 允许从 ORM 对象直接创建 (类似 Spring 的 BeanUtils.copyProperties)
-    # model_config 取代了 Pydantic v1 的 class Config
-    model_config = ConfigDict(from_attributes=True)
-
-
-class StudentQuery(BaseModel):
-    """学生分页查询条件"""
-    name: Optional[str] = Field(default=None, description="姓名(模糊)")
-    student_no: Optional[str] = Field(default=None, description="学号(精确)")
-    clazz: Optional[str] = Field(default=None, description="班级(精确)")
-    page: int = Field(default=1, ge=1, description="页码, 从1开始")
-    size: int = Field(default=10, ge=1, le=100, description="每页条数")
+    def __repr__(self) -> str:
+        return f"<Student id={self.id} name={self.name} student_no={self.student_no}>"

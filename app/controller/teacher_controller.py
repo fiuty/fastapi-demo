@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.common.response import PageData, Response
 from app.database import get_db
-from app.pojo.teacher import TeacherCreate, TeacherUpdate, TeacherVO
+from app.model.teacher import TeacherCreate, TeacherUpdate, TeacherVO
 from app.service.teacher_service import TeacherService
 
 router = APIRouter(

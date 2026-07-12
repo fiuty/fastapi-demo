@@ -6,7 +6,7 @@ from typing import Optional
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
-from app.model.message import Message
+from app.pojo.message import Message
 
 
 class MessageDAO:

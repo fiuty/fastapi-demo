@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.pojo.conversation import ConversationCreate, ConversationUpdate, ConversationDetailVO, ConversationVO
+from app.model.conversation import ConversationCreate, ConversationUpdate, ConversationVO
 from app.service.conversation_service import ConversationService
 
 router = APIRouter(prefix="/api/conversations", tags=["会话管理"])

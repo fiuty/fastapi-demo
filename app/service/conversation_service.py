@@ -8,9 +8,9 @@ from sqlalchemy.orm import Session
 from app.common.exception import BizException
 from app.dao.conversation_dao import ConversationDAO
 from app.dao.message_dao import MessageDAO
-from app.model.conversation import Conversation
-from app.pojo.conversation import ConversationCreate, ConversationUpdate, ConversationDetailVO, ConversationVO
-from app.pojo.message import MessageVO
+from app.pojo.conversation import Conversation
+from app.model.conversation import ConversationCreate, ConversationUpdate, ConversationDetailVO
+from app.model.message import MessageVO
 from app.service.agentscope.agent_service import AgentService
 
 

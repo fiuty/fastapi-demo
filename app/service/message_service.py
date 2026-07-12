@@ -7,7 +7,7 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.dao.message_dao import MessageDAO
-from app.model.message import Message
+from app.pojo.message import Message
 from agentscope.message import Msg
 
 logger = logging.getLogger("agentscope")

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.common.response import PageData, Response
 from app.database import get_db
-from app.pojo.student import StudentCreate, StudentQuery, StudentUpdate, StudentVO
+from app.model.student import StudentCreate, StudentUpdate, StudentVO
 from app.service.student_service import StudentService
 
 router = APIRouter(

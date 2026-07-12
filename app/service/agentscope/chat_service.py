@@ -21,7 +21,6 @@ from sqlalchemy.orm import Session
 from agentscope.event import (
     ReplyStartEvent,
     ReplyEndEvent,
-    ReplyEndReason,
     TextBlockDeltaEvent,
     TextBlockStartEvent,
     TextBlockEndEvent,
@@ -48,8 +47,8 @@ from agentscope.message import Msg, UserMsg, AssistantMsg
 from agentscope.message._block import ToolCallState
 from agentscope.state import AgentState
 
-from app.model import Conversation
-from app.model.message import Message
+from app.pojo import Conversation
+from app.pojo import Message
 from app.service.agentscope.agent_service import AgentService
 
 logger = logging.getLogger("agentscope")
@@ -100,7 +99,7 @@ class ChatService:
         conversation_id: str | None = None,
         user_id: str = "default_user",
     ) -> AsyncGenerator[dict, None]:
-        conversation, message = self.handle_conversation(user_message, conversation_id, user_id)
+        conversation, message = await self.handle_conversation(user_message, conversation_id, user_id)
         session_id = conversation.id
         # 若同会话存在尚未结束的回复, 取消并等待其清理完成后再继续
         await ChatService._cancel_running_task(session_id)

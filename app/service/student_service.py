@@ -7,8 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.common.exception import BizException
 from app.dao.student_dao import StudentDAO
-from app.model.student import Student
-from app.pojo.student import StudentCreate, StudentUpdate
+from app.pojo.student import Student
+from app.model.student import StudentCreate, StudentUpdate
 
 
 class StudentService:

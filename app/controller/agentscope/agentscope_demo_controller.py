@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.pojo.message import ChatRequest, ChatInteractiveRequest, InterruptRequest
+from app.model.message import ChatRequest, ChatInteractiveRequest, InterruptRequest
 from app.service.agentscope.chat_service import ChatService
 
 logger = logging.getLogger("agentscope")

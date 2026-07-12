@@ -75,26 +75,31 @@ public class StudentController {
 ```
 
 **Python**
+
 ```python
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from app.common.response import Response
 from app.database import get_db
-from app.pojo.student import StudentCreate, StudentVO
+from app.model.student import StudentCreate, StudentVO
 from app.service.student_service import StudentService
 
 router = APIRouter(prefix="/api/students", tags=["学生管理"])
 
+
 def get_service(db: Session = Depends(get_db)) -> StudentService:
     return StudentService(db)
+
 
 @router.post("", response_model=Response[StudentVO], status_code=201)
 def create(form: StudentCreate, service: StudentService = Depends(get_service)):
     return Response[StudentVO].ok(StudentVO.model_validate(service.create_student(form)))
 
+
 @router.get("/{student_id}", response_model=Response[StudentVO])
 def get_by_id(student_id: int, service: StudentService = Depends(get_service)):
     return Response[StudentVO].ok(StudentVO.model_validate(service.get_student(student_id)))
+
 
 @router.get("", response_model=Response[PageData[StudentVO]])
 def page(...): ...

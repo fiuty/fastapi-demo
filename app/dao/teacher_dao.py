@@ -6,7 +6,7 @@ from typing import Optional
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
-from app.model.teacher import Teacher
+from app.pojo.teacher import Teacher
 
 
 class TeacherDAO:

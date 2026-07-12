@@ -10,7 +10,7 @@ from typing import Optional
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
-from app.model.student import Student
+from app.pojo.student import Student
 
 
 class StudentDAO:
