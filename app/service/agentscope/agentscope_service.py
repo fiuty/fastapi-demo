@@ -54,6 +54,10 @@ from app.pojo import Conversation
 from app.pojo import Message
 from app.common.exception import BizException
 from app.service.agentscope.agent_service import AgentService
+from app.middleware.model_retry_notifier import (
+    _RETRY_STATE_KEY,
+    _RETRY_NOTIFICATIONS_KEY,
+)
 
 logger = logging.getLogger("agentscope")
 
@@ -158,6 +162,10 @@ class AgentscopeService:
         # 4. 创建独立 Agent (不复用全局单例, 避免并发会话 state 互相覆盖)
         agent = await AgentService.create_agent_with_state(state)
 
+        # 4.1 清理上一轮可能遗留的重试状态, 确保本轮通知计数从零开始
+        agent.state.middle_context.pop(_RETRY_STATE_KEY, None)
+        agent.state.middle_context.pop(_RETRY_NOTIFICATIONS_KEY, None)
+
         # 5. 自动确认上一轮遗留的 ASKING 工具调用, 避免同一会话一直卡在等待结果
         AgentscopeService._auto_confirm_pending_tool_calls(agent)
 
@@ -189,6 +197,12 @@ class AgentscopeService:
                     assistant_msg.append_event(event)
 
                 mapped = self._map_event(event)
+
+                # 在推送每个 Agent 事件前, 先推送积压的模型重试/回退通知
+                for retry_event in self._drain_retry_notifications(agent):
+                    full_response.append(retry_event)
+                    yield retry_event
+
                 if mapped is None:
                     continue
 
@@ -597,6 +611,11 @@ class AgentscopeService:
                     assistant_msg.append_event(event)
 
                 mapped = self._map_event(event)
+
+                for retry_event in self._drain_retry_notifications(agent):
+                    full_response.append(retry_event)
+                    yield retry_event
+
                 if mapped is None:
                     continue
 
@@ -765,6 +784,24 @@ class AgentscopeService:
                 async for event in agent_gen:
                     yield event
                 return
+
+    @staticmethod
+    def _drain_retry_notifications(agent) -> list[dict]:
+        """取出并清空 Agent 积压的模型重试/回退通知。
+
+        中间件将通知写入 ``agent.state.middle_context["_retry_notifications"]``,
+        上层事件循环在推送每个 Agent 事件前调用本方法, 确保前端及时收到反馈。
+
+        Returns:
+            格式为 ``{"event": "model_retry", "data": {...}}`` 的事件列表
+        """
+        notifications = agent.state.middle_context.pop(
+            _RETRY_NOTIFICATIONS_KEY, [],
+        )
+        return [
+            {"event": "model_retry", "data": n}
+            for n in notifications
+        ]
 
     def _map_event(self, event) -> dict | None:
         event_name = event.type.value.lower()

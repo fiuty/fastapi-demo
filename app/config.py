@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = "https://api.deepseek.com"
     LLM_MODEL_NAME: str = "deepseek-v4-flash"
 
+    # LLM 默认配置
+    BACK_LLM_API_KEY: str = ""
+    BACK_LLM_BASE_URL: str = "https://api.deepseek.com"
+    BACK_LLM_MODEL_NAME: str = "deepseek-v4-flash"
+
     # Redis 配置 (AgentState 持久化)
     REDIS_HOST: str = "127.0.0.1"
     REDIS_PORT: int = 6379

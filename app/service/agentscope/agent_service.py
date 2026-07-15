@@ -13,6 +13,7 @@ from agentscope.credential import (
     DeepSeekCredential,
     OpenAICredential,
 )
+from agentscope.middleware import MiddlewareBase
 from agentscope.model import (
     ChatModelBase,
     DashScopeChatModel,
@@ -23,6 +24,7 @@ from agentscope.state import AgentState
 from agentscope.tool import Toolkit
 
 from app.config import settings
+from app.middleware import ModelRetryNotifierMiddleware
 from app.service.agentscope.tool_kit_service import ToolkitService
 
 logger = logging.getLogger("agentscope")
@@ -42,6 +44,8 @@ class AgentService:
     _agent: Optional[Agent] = None
     # RedisStorage 单例 (app 启动时初始化)
     _storage: Optional[RedisStorage] = None
+    # 全局中间件列表 (Agent 模板创建时设置, 供 create_agent_with_state 复用)
+    _middlewares: Optional[list[MiddlewareBase]] = None
     # 固定的 user_id / agent_id (当前无用户体系, 写死)
     USER_ID = "default_user"
     AGENT_ID = "global_assistant"
@@ -175,6 +179,7 @@ class AgentService:
         max_iters: int = 20,
         context_config: Optional[ContextConfig] = None,
         react_config: Optional[ReActConfig] = None,
+        middlewares: Optional[list[MiddlewareBase]] = None,
     ) -> Agent:
         """创建 Agent (核心方法)
 
@@ -187,6 +192,7 @@ class AgentService:
             max_iters: ReAct 循环最大迭代次数
             context_config: 上下文压缩配置 (None 时从 config 读取默认值)
             react_config: ReAct 配置 (None 时使用 max_iters 创建默认值)
+            middlewares: AgentScope 中间件列表 (默认包含 ModelRetryNotifierMiddleware)
 
         Returns:
             Agent 实例
@@ -201,12 +207,18 @@ class AgentService:
         if react_config is None:
             react_config = ReActConfig(max_iters=max_iters)
 
+        if middlewares is None:
+            middlewares = [ModelRetryNotifierMiddleware()]
+
+        back_model = AgentService.create_model(api_key=settings.BACK_LLM_API_KEY, base_url=settings.BACK_LLM_BASE_URL,
+                                               model_name=settings.BACK_LLM_MODEL_NAME)
         return Agent(
             name=name,
             system_prompt=system_prompt,
             model=model,
             toolkit=toolkit,
-            model_config=ModelConfig(max_retries=max_retries),
+            middlewares=middlewares,
+            model_config=ModelConfig(max_retries=max_retries, fallback_model=back_model),
             react_config=react_config,
             context_config=context_config,
         )
@@ -223,6 +235,7 @@ class AgentService:
         max_retries: int = 3,
         max_iters: int = 20,
         context_config: Optional[ContextConfig] = None,
+        middlewares: Optional[list[MiddlewareBase]] = None,
     ) -> Agent:
         """使用默认模型创建 Agent (便捷方法)
 
@@ -239,6 +252,7 @@ class AgentService:
             max_retries: 最大重试次数
             max_iters: ReAct 最大迭代次数
             context_config: 上下文压缩配置 (None 时从 config 读取默认值)
+            middlewares: AgentScope 中间件列表
 
         Returns:
             Agent 实例
@@ -258,6 +272,7 @@ class AgentService:
             max_retries=max_retries,
             max_iters=max_iters,
             context_config=context_config,
+            middlewares=middlewares,
         )
 
     # ======================== 全局 Agent 管理 ========================
@@ -314,7 +329,7 @@ class AgentService:
 
         1. 从 Redis 获取 AgentRecord (name / system_prompt / context_config / react_config)
         2. 首次对话时 Agent 记录不存在则从配置创建并持久化到 Redis
-        3. 复用全局 Agent 模板的 model / toolkit, 构建独立 Agent 实例并绑定 state
+        3. 复用全局 Agent 模板的 model / toolkit / middlewares, 构建独立 Agent 实例并绑定 state
 
         多个并发会话各自调用本方法获取独立 Agent 实例, 不会互相覆盖 state。
         """
@@ -348,6 +363,7 @@ class AgentService:
             system_prompt=data.system_prompt,
             model=template.model,
             toolkit=template.toolkit,
+            middlewares=cls._middlewares,
             model_config=template.model_config,
             react_config=data.react_config,
             context_config=data.context_config,
@@ -416,9 +432,12 @@ class AgentService:
     def _create_default_agent(cls) -> Agent:
         """创建默认全局 Agent"""
         model = cls.create_model()
+        middlewares = [ModelRetryNotifierMiddleware()]
+        cls._middlewares = middlewares
         return cls.create_agent(
             name=cls.DEFAULT_NAME,
             system_prompt=cls.DEFAULT_SYSTEM_PROMPT,
             model=model,
-            toolkit=ToolkitService.create_default_toolkit()
+            toolkit=ToolkitService.create_default_toolkit(),
+            middlewares=middlewares,
         )
