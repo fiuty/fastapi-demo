@@ -12,6 +12,12 @@ AgentscopeService: Agent 流式对话服务
 - 中断暂停中的回复(等待用户确认/外部执行): 通过 UserInterruptEvent 清理待处理工具调用。
 - 恢复: 携带 conversation_id 再次调用 chat_stream 即可, 历史消息与状态从
   Redis/DB 恢复, 不会丢失。
+
+模型重试实时通知:
+  通过 _interruptible_agent_stream 的 retry_queue 参数, 在 asyncio.wait
+  中同时监听 Agent 事件、中断信号和 retry_queue.get() 三路信号。
+  当中间件在 _call_model 阻塞期间将通知放入 Queue, 合并流立即将其
+  yield 给前端, 实现每次重试的即时反馈。
 """
 import asyncio
 import json
@@ -56,10 +62,26 @@ from app.common.exception import BizException
 from app.service.agentscope.agent_service import AgentService
 from app.middleware.model_retry_notifier import (
     _RETRY_STATE_KEY,
-    _RETRY_NOTIFICATIONS_KEY,
+    _RETRY_QUEUE_KEY,
 )
 
 logger = logging.getLogger("agentscope")
+
+
+class RetryNotification:
+    """重试/回退通知包装器, 用于在 _interruptible_agent_stream 中
+    将 retry_queue 的通知与原生的 AgentScope 事件统一 yield。
+
+    通过 isinstance(event, RetryNotification) 与 AgentScope 事件区分。
+    """
+
+    __slots__ = ("data",)
+
+    def __init__(self, data: dict) -> None:
+        self.data = data
+
+    def to_sse_dict(self) -> dict:
+        return {"event": "model_retry", "data": self.data}
 
 
 class AgentscopeService:
@@ -164,7 +186,10 @@ class AgentscopeService:
 
         # 4.1 清理上一轮可能遗留的重试状态, 确保本轮通知计数从零开始
         agent.state.middle_context.pop(_RETRY_STATE_KEY, None)
-        agent.state.middle_context.pop(_RETRY_NOTIFICATIONS_KEY, None)
+
+        # 4.2 创建重试通知队列, 注入到 AgentState 供中间件写入
+        retry_queue: asyncio.Queue = asyncio.Queue()
+        agent.state.middle_context[_RETRY_QUEUE_KEY] = retry_queue
 
         # 5. 自动确认上一轮遗留的 ASKING 工具调用, 避免同一会话一直卡在等待结果
         AgentscopeService._auto_confirm_pending_tool_calls(agent)
@@ -188,7 +213,15 @@ class AgentscopeService:
         try:
             async for event in self._interruptible_agent_stream(
                 agent.reply_stream(agent_input), interrupt_event,
+                retry_queue=retry_queue,
             ):
+                # 重试/回退通知 (来自中间件 via retry_queue)
+                if isinstance(event, RetryNotification):
+                    retry_event = event.to_sse_dict()
+                    full_response.append(retry_event)
+                    yield retry_event
+                    continue
+
                 if isinstance(event, ReplyStartEvent):
                     assistant_msg = AssistantMsg(
                         name=event.name, content=[], id=event.reply_id,
@@ -197,12 +230,6 @@ class AgentscopeService:
                     assistant_msg.append_event(event)
 
                 mapped = self._map_event(event)
-
-                # 在推送每个 Agent 事件前, 先推送积压的模型重试/回退通知
-                for retry_event in self._drain_retry_notifications(agent):
-                    full_response.append(retry_event)
-                    yield retry_event
-
                 if mapped is None:
                     continue
 
@@ -322,6 +349,11 @@ class AgentscopeService:
         所有异常被捕获并记录, 不向上抛出, 保证 finally 语义稳定 ——
         无论流正常结束、被中断还是异常, 均会执行持久化。
         """
+        # 0. 清理 non-serializable 的中间件上下文, 避免 save_state 时
+        #    Pydantic 序列化 middle_context 中的 asyncio.Queue 报错
+        agent.state.middle_context.pop(_RETRY_QUEUE_KEY, None)
+        agent.state.middle_context.pop(_RETRY_STATE_KEY, None)
+
         # 注销当前任务与中断信号, 释放会话锁
         AgentscopeService._unregister_task(session_id)
         AgentscopeService._clear_interrupt_event(session_id)
@@ -588,6 +620,11 @@ class AgentscopeService:
 
         agent = await AgentService.create_agent_with_state(state)
 
+        # 清理上一轮遗留的重试状态, 创建 retry_queue 并注入 AgentState
+        agent.state.middle_context.pop(_RETRY_STATE_KEY, None)
+        retry_queue: asyncio.Queue = asyncio.Queue()
+        agent.state.middle_context[_RETRY_QUEUE_KEY] = retry_queue
+
         # 构建输入
         agent_input = self._build_interactive_input(agent, user_message, confirm_results, user_id)
         if agent_input is None:
@@ -600,9 +637,20 @@ class AgentscopeService:
         yield {"event": "conversation_id", "data": {"conversation_id": conversation.id}}
 
         assistant_msg = None
+        # 交互模式不响应中断, 但复用 _interruptible_agent_stream 以支持 retry_queue 实时通知
+        _dummy_interrupt = asyncio.Event()
 
         try:
-            async for event in agent.reply_stream(agent_input):
+            async for event in self._interruptible_agent_stream(
+                agent.reply_stream(agent_input), _dummy_interrupt,
+                retry_queue=retry_queue,
+            ):
+                # 重试/回退通知 (来自中间件 via retry_queue)
+                if isinstance(event, RetryNotification):
+                    retry_event = event.to_sse_dict()
+                    full_response.append(retry_event)
+                    yield retry_event
+                    continue
                 if isinstance(event, ReplyStartEvent):
                     assistant_msg = AssistantMsg(
                         name=event.name, content=[], id=event.reply_id,
@@ -611,11 +659,6 @@ class AgentscopeService:
                     assistant_msg.append_event(event)
 
                 mapped = self._map_event(event)
-
-                for retry_event in self._drain_retry_notifications(agent):
-                    full_response.append(retry_event)
-                    yield retry_event
-
                 if mapped is None:
                     continue
 
@@ -626,6 +669,10 @@ class AgentscopeService:
             yield {"event": "error", "data": {"message": str(e)}}
             return
         finally:
+            # 清理 non-serializable 上下文, 避免 asyncio.Queue 序列化失败
+            agent.state.middle_context.pop(_RETRY_QUEUE_KEY, None)
+            agent.state.middle_context.pop(_RETRY_STATE_KEY, None)
+
             await AgentService.save_state(session_id, agent.state)
             self.msg_service.save_assistant_message(
                 conversation.id,
@@ -738,70 +785,130 @@ class AgentscopeService:
     async def _interruptible_agent_stream(
         agent_gen: AsyncGenerator,
         interrupt_event: asyncio.Event,
+        retry_queue: asyncio.Queue | None = None,
     ) -> AsyncGenerator:
-        """包装 Agent 流, 支持 interrupt_event 即时中断。
+        """包装 Agent 流, 同时支持 interrupt_event 即时中断和 retry_queue 实时重试通知。
 
-        通过 asyncio.wait 将 agent_gen.__anext__() 与 interrupt_event.wait()
-        竞争。中断信号触发时取消 __anext__() 任务, 将 CancelledError 精确
-        注入 Agent 的 reply_stream 生成器, 触发 SDK 中断清理路径
-        (_reply_impl except CancelledError -> INTERRUPTED 结束事件)。
+        当 retry_queue 为 None 时, 使用原有的二路竞争逻辑
+        (agent_gen vs interrupt) — 保持向后兼容, 不引入额外开销。
 
-        必要性: task.cancel() 取消整个请求任务, CancelledError 可能落在
-        HTTP 客户端或 Starlette send() 中, 无法可靠到达 Agent 生成器。
-        通过独立任务包装 __anext__(), cancel() 可将 CancelledError 直接
-        throw 到 reply_stream 生成器的当前 await 点。
+        当 retry_queue 不为 None 时, 采用生产者-消费者模式:
+        - agent_producer (后台 task): 独占消费 agent_gen + 中断处理 → 写入 event_queue
+        - retry_producer (后台 task): 消费 retry_queue → 写入 RetryNotification 到 event_queue
+        - 主循环: 读 event_queue → yield
+
+        此设计避免了在 agent_gen.__anext__() 阻塞期间 cancel+重建的并发问题,
+        确保异步生成器的 __anext__() 仅被单一 task 消费, 永不竞争。
+
+        Args:
+            agent_gen: Agent reply_stream 生成器
+            interrupt_event: 中断信号 Event
+            retry_queue: 重试通知队列 (None 时走旧逻辑)
+
+        Yields:
+            AgentScope 事件 或 RetryNotification 包装的重试通知
         """
-        while True:
-            get_next = asyncio.ensure_future(agent_gen.__anext__())
-            wait_interrupt = asyncio.ensure_future(interrupt_event.wait())
-            try:
-                done, pending = await asyncio.wait(
-                    [get_next, wait_interrupt],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            except asyncio.CancelledError:
-                # 外部 task.cancel() 传播, 清理后重抛
-                get_next.cancel()
-                wait_interrupt.cancel()
-                raise
-
-            if get_next in done:
-                # 正常收到 Agent 事件
-                wait_interrupt.cancel()
+        # ---- 无 retry_queue: 原有二路竞争逻辑 (不动) ----
+        if retry_queue is None:
+            while True:
+                get_next = asyncio.ensure_future(agent_gen.__anext__())
+                wait_interrupt = asyncio.ensure_future(interrupt_event.wait())
                 try:
-                    yield get_next.result()
-                except StopAsyncIteration:
+                    done, pending = await asyncio.wait(
+                        [get_next, wait_interrupt],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError:
+                    get_next.cancel()
+                    wait_interrupt.cancel()
+                    raise
+
+                if get_next in done:
+                    wait_interrupt.cancel()
+                    try:
+                        yield get_next.result()
+                    except StopAsyncIteration:
+                        return
+                else:
+                    wait_interrupt.cancel()
+                    get_next.cancel()
+                    try:
+                        yield await get_next
+                    except (StopAsyncIteration, asyncio.CancelledError):
+                        pass
+                    async for event in agent_gen:
+                        yield event
                     return
-            else:
-                # 中断信号触发: 取消 __anext__(), 将 CancelledError 注入 Agent。
-                # SDK 捕获后产出 INTERRUPTED 清理事件, 排空后正常结束。
-                wait_interrupt.cancel()
-                get_next.cancel()
-                try:
-                    yield await get_next
-                except (StopAsyncIteration, asyncio.CancelledError):
-                    pass
-                async for event in agent_gen:
-                    yield event
-                return
 
-    @staticmethod
-    def _drain_retry_notifications(agent) -> list[dict]:
-        """取出并清空 Agent 积压的模型重试/回退通知。
+        # ---- 有 retry_queue: 生产者-消费者模式 ----
+        event_queue: asyncio.Queue = asyncio.Queue()
+        agent_done: asyncio.Event = asyncio.Event()
 
-        中间件将通知写入 ``agent.state.middle_context["_retry_notifications"]``,
-        上层事件循环在推送每个 Agent 事件前调用本方法, 确保前端及时收到反馈。
+        async def agent_producer() -> None:
+            """独占消费 agent_gen, 将事件写入 event_queue, 同时监听中断。"""
+            try:
+                while True:
+                    ag = asyncio.ensure_future(agent_gen.__anext__())
+                    it = asyncio.ensure_future(interrupt_event.wait())
+                    done, pending = await asyncio.wait(
+                        [ag, it], return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if it in done:
+                        # 中断: cancel __anext__(), 注入 CancelledError 到 Agent
+                        ag.cancel()
+                        for t in pending:
+                            t.cancel()
+                        try:
+                            await ag
+                        except (StopAsyncIteration, asyncio.CancelledError):
+                            pass
+                        # 排空中断后的残余事件
+                        async for event in agent_gen:
+                            await event_queue.put(event)
+                        break
+                    # 正常 Agent 事件
+                    for t in pending:
+                        t.cancel()
+                    try:
+                        await event_queue.put(ag.result())
+                    except StopAsyncIteration:
+                        break
+            finally:
+                agent_done.set()
 
-        Returns:
-            格式为 ``{"event": "model_retry", "data": {...}}`` 的事件列表
-        """
-        notifications = agent.state.middle_context.pop(
-            _RETRY_NOTIFICATIONS_KEY, [],
-        )
-        return [
-            {"event": "model_retry", "data": n}
-            for n in notifications
-        ]
+        async def retry_producer() -> None:
+            """消费 retry_queue, 将 RetryNotification 写入 event_queue。"""
+            while not agent_done.is_set():
+                rg = asyncio.ensure_future(retry_queue.get())
+                ad = asyncio.ensure_future(agent_done.wait())
+                done, _ = await asyncio.wait(
+                    [rg, ad], return_when=asyncio.FIRST_COMPLETED,
+                )
+                rg.cancel()
+                ad.cancel()
+                if agent_done.is_set():
+                    return
+                notification = rg.result()
+                await event_queue.put(RetryNotification(notification))
+
+        agent_task = asyncio.create_task(agent_producer())
+        retry_task = asyncio.create_task(retry_producer())
+
+        try:
+            while not (agent_done.is_set() and event_queue.empty()):
+                eq = asyncio.ensure_future(event_queue.get())
+                ad = asyncio.ensure_future(agent_done.wait())
+                done, _ = await asyncio.wait(
+                    [eq, ad], return_when=asyncio.FIRST_COMPLETED,
+                )
+                eq.cancel()
+                ad.cancel()
+                if agent_done.is_set() and event_queue.empty():
+                    return
+                yield eq.result()
+        finally:
+            agent_task.cancel()
+            retry_task.cancel()
 
     def _map_event(self, event) -> dict | None:
         event_name = event.type.value.lower()

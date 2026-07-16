@@ -446,35 +446,57 @@ for model in models:
 
 ### 解决方案
 
-利用 AgentScope 2.0.4 的 **`on_model_call` 洋葱钩子（middleware hook）**，在每次模型调用失败时捕获异常信息，写入 `AgentState.middle_context` 的通知队列。上层服务循环在消费 Agent 事件流时主动排空通知并转发为 SSE `model_retry` 事件。
+利用 AgentScope 2.0.4 的 **`on_model_call` 洋葱钩子（middleware hook）**，在每次模型调用失败时捕获异常信息，通过 `asyncio.Queue` 实时推送。`_interruptible_agent_stream` 通过 `asyncio.wait` 同时监听三路信号（Agent 事件 / 中断 / retry_queue），重试通知到达时**立即** yield，不等待 Agent 生成器恢复。
 
 ### 架构
 
 ```
-_reasoning_impl()
+chat_stream()
   │
-  ├─ yield ModelCallStartEvent        ← 前端收到 "model_call_start"
+  ├─ retry_queue = asyncio.Queue()
+  ├─ agent.state.middle_context["_retry_queue"] = retry_queue
   │
-  ├─ await _call_model()              ← 阻塞，内部循环重试/回退
-  │     │
-  │     ├─ on_model_call(mw, attempt=1) → 失败 → 写入通知到 middle_context
-  │     ├─ on_model_call(mw, attempt=2) → 失败 → 写入通知到 middle_context
-  │     ├─ on_model_call(mw, attempt=3) → 失败 → 写入通知到 middle_context
-  │     ├─ 模型 exhausted → fallback 日志
-  │     ├─ on_model_call(mw, attempt=1, fallback) → 成功 ← 返回结果
-  │     │
-  │     └─ 返回成功结果
-  │
-  ├─ yield ModelCallEndEvent          ← yield 前，服务层 drain 通知队列
-  │                                     先推送 model_retry 事件，再推送 model_call_end
-  ...
+  └─ _interruptible_agent_stream(agent_gen, interrupt_event, retry_queue)
+       │
+       │  retry_queue is None → 原有二路竞争 (agent_gen vs interrupt) 不受影响
+       │
+       │  retry_queue is not None → 生产者-消费者模式:
+       │
+       ├── agent_producer (asyncio.Task)
+       │    │  独占消费 agent_gen.__anext__()
+       │    │  同时监听 interrupt_event 实现中断
+       │    │  → event_queue.put(agent_event)
+       │    │  → agent_done.set()  // 流结束
+       │    │
+       │    │  关键: __anext__() 仅被此 task 独占调用，
+       │    │  永不与其他 task 竞争或中途 cancel，
+       │    │  避免异步生成器的并发状态污染。
+       │    │
+       ├── retry_producer (asyncio.Task)
+       │    │  消费 retry_queue.get()
+       │    │  与 agent_done.wait() 竞争 (防止死等)
+       │    │  → event_queue.put(RetryNotification(data))
+       │    │
+       └── 主循环
+            │  event_queue.get()  ← 等待任一生产者写入
+            │  与 agent_done.wait() 竞争
+            │  → yield (AgentScope 事件 或 RetryNotification)
+            │  → agent_done 且 queue 空 → 退出
 ```
+
+**为什么必须用生产者-消费者模式？**
+
+`agent_gen.__anext__()` 在 `_call_model` 阻塞期间是一个**长生命周期**的 coroutine。如果在三路 `asyncio.wait` 竞争中，retry_queue 获胜后对 `__anext__()` 的 future 执行 `cancel()` 然后下一轮重新创建，会破坏异步生成器的内部状态（同一生成器不能有两个并发的 `__anext__()` 调用）。
+
+将 Agent 事件消费和重试通知消费分离为两个独立后台 Task，通过中间 `event_queue` 合并输出，`__anext__()` 只被 `agent_producer` 独占，**永不中途取消**，保证生成器状态安全。
+
+`_call_model` 阻塞期间，`agent_producer` 的 `__anext__()` 卡在 `await _call_model()` 上。中间件通过 `retry_queue.put_nowait()` 写入通知 → `retry_producer` 的 `get()` 立即返回 → `event_queue.put(RetryNotification)` → 主循环 `get()` 立即返回 → **实时 yield 给前端**。两条路径完全独立，互不阻塞。
 
 ### 新增文件
 
 #### `app/middleware/model_retry_notifier.py`
 
-`ModelRetryNotifierMiddleware` 继承 `MiddlewareBase`，实现 `on_model_call` hook。识别三种通知类型：
+`ModelRetryNotifierMiddleware` 继承 `MiddlewareBase`，实现 `on_model_call` hook。识别三种通知类型，通过 `put_nowait` 写入 `asyncio.Queue`（存储在 `agent.state.middle_context["_retry_queue"]`）：
 
 | 通知 type | 触发条件 | 含义 |
 |-----------|---------|------|
@@ -482,7 +504,7 @@ _reasoning_impl()
 | `fallback` | 首次见到新模型名且非首个模型 | 主模型不可用，切换到备用模型 |
 | `recovery` | 某模型 attempts > 1 后 `next_handler()` 成功 | 重试后调用成功，模型恢复 |
 
-通知写入 `agent.state.middle_context["_retry_notifications"]` 列表，每次 `_call_model` 开始时通过 `pop` 清理上轮残留。
+通知通过 `put_nowait` 写入 `retry_queue`，`_interruptible_agent_stream` 的另一条异步路径监听 `retry_queue.get()`，通知到达时立即 yield 不等待 Agent 事件。
 
 ### 涉及改动的文件
 
@@ -491,7 +513,7 @@ _reasoning_impl()
 | `app/middleware/__init__.py` | 导出 `ModelRetryNotifierMiddleware` |
 | `app/middleware/model_retry_notifier.py` | **新增** 中间件实现 |
 | `app/service/agentscope/agent_service.py` | `create_agent()` / `create_agent_with_state()` 默认注入中间件；新增 `_middlewares` 类变量复用 |
-| `app/service/agentscope/agentscope_service.py` | `chat_stream()` / `chat_stream_interactive()` 中每个 Agent 事件 yield 前调用 `_drain_retry_notifications()`；新增 `_drain_retry_notifications()` 方法 |
+| `app/service/agentscope/agentscope_service.py` | 新增 `RetryNotification` 类；`_interruptible_agent_stream` 采用生产者-消费者模式（`agent_producer` + `retry_producer` + 中间 `event_queue`）；`chat_stream()` / `chat_stream_interactive()` 注入 retry_queue 并消费 `RetryNotification`；`_persist_after_stream` 清理 non-serializable 上下文 |
 
 ### SSE 事件示例
 
@@ -558,7 +580,7 @@ eventSource.addEventListener('model_retry', (e) => {
 });
 ```
 
-> **注意**：重试/回退通知在 `model_call_start` 之后、`model_call_end` 之前批量到达（因为 Agent 事件流在 `_call_model` 期间被阻塞）。前端在此期间不会收到其他事件，应保持 loading 状态，在收到 `model_retry` 时更新提示文案。
+> **注意**：`RetryNotification` 通过生产者-消费者模式实现**实时推送**。`retry_producer` 和 `agent_producer` 是两个独立的 `asyncio.Task`，各自通过 `event_queue` 合并输出。中间件每次 `put_nowait` 后，`retry_producer` 立即将 `RetryNotification` 写入 `event_queue`，主循环立即 yield——与 `_call_model` 是否阻塞无关。
 
 ---
 
