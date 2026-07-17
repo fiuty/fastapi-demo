@@ -794,8 +794,8 @@ class AgentscopeService:
 
         当 retry_queue 不为 None 时, 采用生产者-消费者模式:
         - agent_producer (后台 task): 独占消费 agent_gen + 中断处理 → 写入 event_queue
-        - retry_producer (后台 task): 消费 retry_queue → 写入 RetryNotification 到 event_queue
-        - 主循环: 读 event_queue → yield
+        - 主循环: 三路竞争 (event_queue / retry_queue / agent_done 信号),
+          retry_queue 的消息由主循环直接读取, 不再通过独立 retry_producer 中转
 
         此设计避免了在 agent_gen.__anext__() 阻塞期间 cancel+重建的并发问题,
         确保异步生成器的 __anext__() 仅被单一 task 消费, 永不竞争。
@@ -842,73 +842,63 @@ class AgentscopeService:
 
         # ---- 有 retry_queue: 生产者-消费者模式 ----
         event_queue: asyncio.Queue = asyncio.Queue()
-        agent_done: asyncio.Event = asyncio.Event()
+        agent_done = asyncio.Event()
 
-        async def agent_producer() -> None:
+        async def agent_producer():
             """独占消费 agent_gen, 将事件写入 event_queue, 同时监听中断。"""
             try:
                 while True:
-                    ag = asyncio.ensure_future(agent_gen.__anext__())
-                    it = asyncio.ensure_future(interrupt_event.wait())
-                    done, pending = await asyncio.wait(
-                        [ag, it], return_when=asyncio.FIRST_COMPLETED,
+                    get_next = asyncio.ensure_future(agent_gen.__anext__())
+                    wait_int = asyncio.ensure_future(interrupt_event.wait())
+                    done, _ = await asyncio.wait(
+                        [get_next, wait_int],
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
-                    if it in done:
-                        # 中断: cancel __anext__(), 注入 CancelledError 到 Agent
-                        ag.cancel()
-                        for t in pending:
-                            t.cancel()
+                    if wait_int.done():
+                        get_next.cancel()
                         try:
-                            await ag
+                            await get_next
                         except (StopAsyncIteration, asyncio.CancelledError):
                             pass
-                        # 排空中断后的残余事件
                         async for event in agent_gen:
                             await event_queue.put(event)
                         break
-                    # 正常 Agent 事件
-                    for t in pending:
-                        t.cancel()
+                    wait_int.cancel()
                     try:
-                        await event_queue.put(ag.result())
+                        await event_queue.put(get_next.result())
                     except StopAsyncIteration:
                         break
             finally:
                 agent_done.set()
 
-        async def retry_producer() -> None:
-            """消费 retry_queue, 将 RetryNotification 写入 event_queue。"""
-            while not agent_done.is_set():
-                rg = asyncio.ensure_future(retry_queue.get())
-                ad = asyncio.ensure_future(agent_done.wait())
-                done, _ = await asyncio.wait(
-                    [rg, ad], return_when=asyncio.FIRST_COMPLETED,
-                )
-                rg.cancel()
-                ad.cancel()
-                if agent_done.is_set():
-                    return
-                notification = rg.result()
-                await event_queue.put(RetryNotification(notification))
-
         agent_task = asyncio.create_task(agent_producer())
-        retry_task = asyncio.create_task(retry_producer())
 
         try:
-            while not (agent_done.is_set() and event_queue.empty()):
-                eq = asyncio.ensure_future(event_queue.get())
-                ad = asyncio.ensure_future(agent_done.wait())
-                done, _ = await asyncio.wait(
-                    [eq, ad], return_when=asyncio.FIRST_COMPLETED,
-                )
-                eq.cancel()
-                ad.cancel()
+            while True:
                 if agent_done.is_set() and event_queue.empty():
                     return
-                yield eq.result()
+
+                get_event = asyncio.ensure_future(event_queue.get())
+                wait_done = asyncio.ensure_future(agent_done.wait())
+                get_retry = asyncio.ensure_future(retry_queue.get())
+                done, _ = await asyncio.wait(
+                    [get_event, wait_done, get_retry],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if get_event in done:
+                    wait_done.cancel()
+                    get_retry.cancel()
+                    yield get_event.result()
+                elif get_retry in done:
+                    get_event.cancel()
+                    wait_done.cancel()
+                    yield RetryNotification(get_retry.result())
+                else:
+                    get_event.cancel()
+                    get_retry.cancel()
         finally:
             agent_task.cancel()
-            retry_task.cancel()
 
     def _map_event(self, event) -> dict | None:
         event_name = event.type.value.lower()

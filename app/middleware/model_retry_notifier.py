@@ -64,26 +64,18 @@ class ModelRetryNotifierMiddleware(MiddlewareBase):
         model = input_kwargs["current_model"]
         model_name = model.model
 
-        # ---- 跟踪状态: 记录每个模型被调用了多少次 ----
+        # ---- 跟踪状态: {model_name: count}, 记录每个模型被调用的次数 ----
         # middle_context 是 AgentState 上的一个 dict,按 key 隔离各中间件状态
         # 每轮 reply 开始时 agentscope_service 会 pop 清理 _retry_state,
         # 确保不同 reply 之间状态不混淆
-        retry_state = agent.state.middle_context.setdefault(
-            _RETRY_STATE_KEY, {},
-        )
-
-        # _tracked: {model_name: {"attempts": N}} 记录每个模型在本轮 reply 中
-        # 被 on_model_call 调用的次数
-        tracked = retry_state.setdefault("_tracked", {})
-        if model_name not in tracked:
-            tracked[model_name] = {"attempts": 0}
-        tracked_info = tracked[model_name]
-        tracked_info["attempts"] += 1
+        retry_state = agent.state.middle_context.setdefault(_RETRY_STATE_KEY, {})
+        count = retry_state.get(model_name, 0) + 1
+        retry_state[model_name] = count
 
         # ---- 检测是否切换到了备用模型 ----
-        # 条件: tracked 中已存在 >1 个模型,且当前模型是首次被调用
+        # 条件: retry_state 中已存在 >1 个模型,且当前模型是首次被调用
         # 此时说明 _call_model 已经遍历完了主模型的所有重试,开始尝试 fallback
-        is_fallback = len(tracked) > 1 and tracked_info["attempts"] == 1
+        is_fallback = len(retry_state) > 1 and count == 1
 
         def _enqueue(notification: dict) -> None:
             """将通知放入 retry_queue (非阻塞, 队列满则丢弃警告)。"""
@@ -107,13 +99,13 @@ class ModelRetryNotifierMiddleware(MiddlewareBase):
             result = await next_handler(**input_kwargs)
 
             # ---- 调用成功 ----
-            # 如果该模型之前失败过 (attempts > 1),说明是经过重试后才成功的,
+            # 如果该模型之前失败过 (count > 1),说明是经过重试后才成功的,
             # 发送 recovery 通知告知前端模型已恢复
-            if tracked_info["attempts"] > 1:
+            if count > 1:
                 _enqueue({
                     "type": "recovery",
                     "model_name": model_name,
-                    "message": f"模型 {model_name} 第 {tracked_info['attempts']} 次调用成功",
+                    "message": f"模型 {model_name} 第 {count} 次调用成功",
                 })
             return result
 
@@ -124,13 +116,13 @@ class ModelRetryNotifierMiddleware(MiddlewareBase):
             _enqueue({
                 "type": "retry",
                 "model_name": model_name,
-                "attempt": tracked_info["attempts"],
+                "attempt": count,
                 "is_fallback": is_fallback,
                 "error": str(e)[:300],
                 "message": (
                     f"备用模型 {model_name} 调用失败，正在重试..."
                     if is_fallback
-                    else f"模型 {model_name} 调用失败，正在重试 ({tracked_info['attempts']}/3)..."
+                    else f"模型 {model_name} 调用失败，正在重试 ({count}/3)..."
                 ),
             })
             raise

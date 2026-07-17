@@ -460,37 +460,41 @@ chat_stream()
        │
        │  retry_queue is None → 原有二路竞争 (agent_gen vs interrupt) 不受影响
        │
-       │  retry_queue is not None → 生产者-消费者模式:
-       │
-       ├── agent_producer (asyncio.Task)
-       │    │  独占消费 agent_gen.__anext__()
-       │    │  同时监听 interrupt_event 实现中断
-       │    │  → event_queue.put(agent_event)
-       │    │  → agent_done.set()  // 流结束
-       │    │
-       │    │  关键: __anext__() 仅被此 task 独占调用，
-       │    │  永不与其他 task 竞争或中途 cancel，
-       │    │  避免异步生成器的并发状态污染。
-       │    │
-       ├── retry_producer (asyncio.Task)
-       │    │  消费 retry_queue.get()
-       │    │  与 agent_done.wait() 竞争 (防止死等)
-       │    │  → event_queue.put(RetryNotification(data))
-       │    │
-       └── 主循环
-            │  event_queue.get()  ← 等待任一生产者写入
-            │  与 agent_done.wait() 竞争
-            │  → yield (AgentScope 事件 或 RetryNotification)
-            │  → agent_done 且 queue 空 → 退出
+        │  retry_queue is not None → 生产者-消费者模式:
+        │
+        ├── agent_producer (asyncio.Task)
+        │    │  独占消费 agent_gen.__anext__()
+        │    │  同时监听 interrupt_event 实现中断
+        │    │  → event_queue.put(agent_event)
+        │    │  → agent_done.set()  // 流结束
+        │    │
+        │    │  关键: __anext__() 仅被此 task 独占调用，
+        │    │  永不与其他 task 竞争或中途 cancel，
+        │    │  避免异步生成器的并发状态污染。
+        │    │
+        └── 主循环 (三路竞争, 无独立 retry_producer)
+             │  asyncio.wait([
+             │      event_queue.get(),    // Agent 事件
+             │      retry_queue.get(),    // 重试通知 (直接读取, 不经中转)
+             │      agent_done.wait(),    // 结束信号
+             │  ])
+             │  按优先级 yield:
+             │    1. get_event 获胜  → yield AgentScope 事件
+             │    2. get_retry 获胜  → yield RetryNotification (实时推送)
+             │    3. wait_done 获胜  → agent_done 且 queue 空 → 退出
+             │
+             │  优化: 主循环直接读 retry_queue, 省去了原先
+             │  retry_producer → event_queue 的中转环节，
+             │  减少一个 asyncio.Task 和一次 Queue 间拷贝。
 ```
 
 **为什么必须用生产者-消费者模式？**
 
 `agent_gen.__anext__()` 在 `_call_model` 阻塞期间是一个**长生命周期**的 coroutine。如果在三路 `asyncio.wait` 竞争中，retry_queue 获胜后对 `__anext__()` 的 future 执行 `cancel()` 然后下一轮重新创建，会破坏异步生成器的内部状态（同一生成器不能有两个并发的 `__anext__()` 调用）。
 
-将 Agent 事件消费和重试通知消费分离为两个独立后台 Task，通过中间 `event_queue` 合并输出，`__anext__()` 只被 `agent_producer` 独占，**永不中途取消**，保证生成器状态安全。
+将 Agent 事件消费作为独立后台 Task（`agent_producer`），通过中间 `event_queue` 与主循环解耦，`__anext__()` 只被 `agent_producer` 独占，**永不中途取消**，保证生成器状态安全。重试通知则由主循环直接从 `retry_queue` 读取——主循环的 `asyncio.wait` 同时竞争 `event_queue.get()`、`retry_queue.get()` 和 `agent_done.wait()` 三路信号，不再需要独立的 `retry_producer` 做中转。
 
-`_call_model` 阻塞期间，`agent_producer` 的 `__anext__()` 卡在 `await _call_model()` 上。中间件通过 `retry_queue.put_nowait()` 写入通知 → `retry_producer` 的 `get()` 立即返回 → `event_queue.put(RetryNotification)` → 主循环 `get()` 立即返回 → **实时 yield 给前端**。两条路径完全独立，互不阻塞。
+`_call_model` 阻塞期间，`agent_producer` 的 `__anext__()` 卡在 `await _call_model()` 上。中间件通过 `retry_queue.put_nowait()` 写入通知 → 主循环的 `retry_queue.get()` 立即返回 → **实时 yield 给前端**。两条路径完全独立，互不阻塞。
 
 ### 新增文件
 
@@ -504,16 +508,16 @@ chat_stream()
 | `fallback` | 首次见到新模型名且非首个模型 | 主模型不可用，切换到备用模型 |
 | `recovery` | 某模型 attempts > 1 后 `next_handler()` 成功 | 重试后调用成功，模型恢复 |
 
-通知通过 `put_nowait` 写入 `retry_queue`，`_interruptible_agent_stream` 的另一条异步路径监听 `retry_queue.get()`，通知到达时立即 yield 不等待 Agent 事件。
+通知通过 `put_nowait` 写入 `retry_queue`，`_interruptible_agent_stream` 的主循环通过 `asyncio.wait` 直接竞争 `retry_queue.get()`，通知到达时立即 yield 不等待 Agent 事件。
 
 ### 涉及改动的文件
 
 | 文件 | 改动 |
 |------|------|
 | `app/middleware/__init__.py` | 导出 `ModelRetryNotifierMiddleware` |
-| `app/middleware/model_retry_notifier.py` | **新增** 中间件实现 |
+| `app/middleware/model_retry_notifier.py` | **新增** 中间件实现, 使用平铺 `{model: count}` 追踪状态 |
 | `app/service/agentscope/agent_service.py` | `create_agent()` / `create_agent_with_state()` 默认注入中间件；新增 `_middlewares` 类变量复用 |
-| `app/service/agentscope/agentscope_service.py` | 新增 `RetryNotification` 类；`_interruptible_agent_stream` 采用生产者-消费者模式（`agent_producer` + `retry_producer` + 中间 `event_queue`）；`chat_stream()` / `chat_stream_interactive()` 注入 retry_queue 并消费 `RetryNotification`；`_persist_after_stream` 清理 non-serializable 上下文 |
+| `app/service/agentscope/agentscope_service.py` | 新增 `RetryNotification` 类；`_interruptible_agent_stream` 采用生产者-消费者模式（`agent_producer` + 主循环三路竞争 `event_queue` / `retry_queue` / `agent_done`）；`chat_stream()` / `chat_stream_interactive()` 注入 retry_queue 并消费 `RetryNotification`；`_persist_after_stream` 清理 non-serializable 上下文 |
 
 ### SSE 事件示例
 
@@ -580,7 +584,7 @@ eventSource.addEventListener('model_retry', (e) => {
 });
 ```
 
-> **注意**：`RetryNotification` 通过生产者-消费者模式实现**实时推送**。`retry_producer` 和 `agent_producer` 是两个独立的 `asyncio.Task`，各自通过 `event_queue` 合并输出。中间件每次 `put_nowait` 后，`retry_producer` 立即将 `RetryNotification` 写入 `event_queue`，主循环立即 yield——与 `_call_model` 是否阻塞无关。
+> **注意**：`RetryNotification` 通过生产者-消费者模式实现**实时推送**。`agent_producer` 是独立的 `asyncio.Task`，主循环通过 `asyncio.wait` 直接竞争 `event_queue.get()`、`retry_queue.get()` 和 `agent_done.wait()` 三路信号。中间件每次 `put_nowait` 后，主循环的 `retry_queue.get()` 立即返回并 yield——与 `_call_model` 是否阻塞无关。
 
 ---
 
