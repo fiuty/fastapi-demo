@@ -24,6 +24,7 @@ from app.controller.conversation_controller import router as conversation_router
 from app.controller.agentscope.agentscope_demo_controller import router as agentscope_router
 from app.database import init_db
 from app.service.agentscope.agent_service import AgentService
+from app.service.agentscope.interrupt_coordinator import InterruptCoordinator
 
 # 日志 (类似 Spring 的 slf4j)
 logging.basicConfig(
@@ -37,13 +38,15 @@ logger = logging.getLogger("app")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用启动/关闭生命周期 (类似 Spring 的 @PostConstruct / @PreDestroy)"""
-    # 启动: 初始化数据库 + RedisStorage
+    # 启动: 初始化数据库 + RedisStorage + 中断协调器
     init_db()
     logger.info("数据库表初始化完成")
     await AgentService.init_storage()
     logger.info("RedisStorage 初始化完成")
+    await InterruptCoordinator.get_instance().start()
     yield
-    # 关闭: 释放 RedisStorage 连接
+    # 关闭: 释放中断协调器 + RedisStorage 连接
+    await InterruptCoordinator.get_instance().stop()
     await AgentService.close_storage()
     logger.info("RedisStorage 已关闭")
 

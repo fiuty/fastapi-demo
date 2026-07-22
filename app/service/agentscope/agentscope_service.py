@@ -60,6 +60,7 @@ from app.pojo import Conversation
 from app.pojo import Message
 from app.common.exception import BizException
 from app.service.agentscope.agent_service import AgentService
+from app.service.agentscope.interrupt_coordinator import InterruptCoordinator
 from app.middleware.model_retry_notifier import (
     _RETRY_STATE_KEY,
     _RETRY_QUEUE_KEY,
@@ -102,12 +103,16 @@ class AgentscopeService:
 
     @classmethod
     def _register_task(cls, session_id: str, task: asyncio.Task) -> None:
-        """注册流式任务, 供中断接口取消"""
+        """注册流式任务, 供中断接口取消; 同时在 Redis 注册以支持跨实例中断。"""
         cls._running_tasks[session_id] = task
+        coordinator = InterruptCoordinator.get_instance()
+        asyncio.ensure_future(coordinator.register_task(session_id))
 
     @classmethod
     def _unregister_task(cls, session_id: str) -> None:
         cls._running_tasks.pop(session_id, None)
+        coordinator = InterruptCoordinator.get_instance()
+        asyncio.ensure_future(coordinator.deregister_task(session_id))
 
     @classmethod
     def _get_interrupt_event(cls, session_id: str) -> asyncio.Event:
@@ -125,7 +130,11 @@ class AgentscopeService:
     @classmethod
     async def _cancel_running_task(cls, session_id: str) -> None:
         """取消同会话已存在的运行任务。若任务尚未完成清理则等待最多 10s,
-        确保前一个请求已将 DB conversation 提交后再继续当前请求。"""
+        确保前一个请求已将 DB conversation 提交后再继续当前请求。
+
+        显式 await Redis 注销, 保证旧 key 删除完成后才允许新任务注册,
+        避免 fire-and-forget 的 Redis DELETE 在新任务 SET 之后执行。
+        """
         task = cls._running_tasks.get(session_id)
         if task is not None and not task.done():
             task.cancel()
@@ -135,6 +144,9 @@ class AgentscopeService:
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
         cls._running_tasks.pop(session_id, None)
+        # 显式 await Redis 注销, 确保旧 key 被删除后才注册新任务
+        coordinator = InterruptCoordinator.get_instance()
+        await coordinator.deregister_task(session_id)
 
     @staticmethod
     def _auto_confirm_pending_tool_calls(agent) -> None:
@@ -399,31 +411,30 @@ class AgentscopeService:
     async def interrupt(self, conversation_id: str) -> dict:
         """中断指定会话的智能体回复。
 
-        两种中断场景(参考 AgentScope 2.0.4 中断智能体文档):
-
-        1. 智能体正在运行: 取消承载 reply_stream 的请求任务, Agent 内部
-           捕获 CancelledError, 清理未完成工具调用并产出 INTERRUPTED 结束事件,
-           上下文保持一致, 可立即通过新输入继续。
-
-           取消后会等待任务清理完成(通常 < 1s, 含 Redis/DB 持久化), 以
-           保证 DB 中 conversation 已提交, 避免后续"继续"请求因未提交而
-           创建重复 conversation 导致消息丢失。
-           最大等待 10 秒, 超时则返回但不影响清理(任务最终仍会完成)。
-
-        2. 智能体处于暂停状态(等待用户确认/外部执行): 向 reply_stream 传入
-           UserInterruptEvent, 清理待处理工具调用并结束当前 reply。
+        支持三种场景:
+        1. 本地运行中: 取消本实例承载 reply_stream 的任务。
+        2. 远程运行中: 通过 Redis Pub/Sub 通知其他实例取消任务。
+        3. 暂停中 (等待用户确认/外部执行): 通过 UserInterruptEvent 清理。
 
         Returns:
             dict: 中断结果, 含 status / conversation_id / reason(或 message)。
         """
-        # 1. 取消正在运行的回复任务, 等待其 finally 持久化完成
+        # 1. 本地运行中的任务 → 直接取消 (快速路径)
         task = AgentscopeService._running_tasks.get(conversation_id)
         if task is not None and not task.done():
             return await AgentscopeService._cancel_and_wait_task(
                 conversation_id, task,
             )
 
-        # 2. 中断暂停中的智能体(等待用户确认/外部执行)
+        # 2. 远程运行中的任务 → 通过 Redis 请求中断
+        coordinator = InterruptCoordinator.get_instance()
+        remote_result = await coordinator.request_remote_interrupt(
+            conversation_id,
+        )
+        if remote_result is not None:
+            return remote_result
+
+        # 3. 暂停中的智能体 (等待用户确认/外部执行)
         return await self._interrupt_parked_agent(conversation_id)
 
     # ======================== interrupt 辅助方法 ========================
@@ -454,7 +465,11 @@ class AgentscopeService:
                 "等待中断清理超时或异常 | conversation_id=%s",
                 conversation_id,
             )
-        cls._unregister_task(conversation_id)
+        # 显式清理本地状态 + await Redis 注销, 确保 key 被删除后才返回
+        cls._running_tasks.pop(conversation_id, None)
+        cls._interrupt_events.pop(conversation_id, None)
+        coordinator = InterruptCoordinator.get_instance()
+        await coordinator.deregister_task(conversation_id)
         logger.info("已中断运行中的对话 | conversation_id=%s", conversation_id)
         return cls._build_interrupt_result(
             conversation_id, status="interrupted", reason="task_cancelled",
